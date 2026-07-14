@@ -2548,6 +2548,13 @@ class MusiApp(App):
         naar het detail-scherm met twee sub-tabs (Artiesten / Playlists).
 
         Bij lege ``query`` tonen we alle categorieën.
+
+        **Fallback bij geen categorie-match**: Spotify's ``categories``-
+        endpoint bevat niet alle genres (New Age, IDM, Vaporwave, …). Als
+        ``q`` niet matcht, renderen we in plaats daarvan een directe
+        fallback-detail-pagina met ``search_artists_by_tag(q)`` +
+        ``search_playlists_by_tag(q)`` — dezelfde view-toggle UX als bij
+        een categorie-detail.
         """
         sp = self.services.providers.get("spotify")
         if sp is None:
@@ -2566,8 +2573,15 @@ class MusiApp(App):
         if q:
             cats = [c for c in cats if q in (c.get("name") or "").lower()]
         if not cats:
-            self.notify(f"Geen categorieën gevonden voor '{query}'.",
-                        severity="warning")
+            # Fallback: render direct het genre-detail (artiesten +
+            # playlists) op de query. Geen Spotify-categorie-ID maar de
+            # vrije tekst-tag — werkt universeel.
+            cat_dummy = {"id": f"tag:{q}", "name": query}
+            self.notify(
+                f"'{query}' is geen Spotify-categorie — valt terug op tag-search.",
+                timeout=4)
+            await self._open_spotify_genre_detail(
+                category_id=f"tag:{q}", view="artists")
             return
         try:
             self.query_one(SearchPane).watch_genre_categories(query, cats)
@@ -2662,23 +2676,36 @@ class MusiApp(App):
         ``view`` bepaalt welke subset meteen zichtbaar is (``artists`` of
         ``playlists``). De app-scope ``self._genre_view`` onthoudt de
         gekozen view voor latere toggle-actie.
+
+        Accepteert ook ``tag:<naam>`` als ``category_id`` voor de
+        fallback-flow (genre is geen Spotify-categorie). In dat geval
+        wordt de tag-letterlijk als zoekterm gebruikt — werkt universeel
+        voor genres die buiten Spotify's categorie-lijst vallen (New
+        Age, IDM, Vaporwave, …).
         """
         sp = self.services.providers.get("spotify")
         if sp is None:
             self.notify("Spotify niet beschikbaar.", severity="error")
             return
-        # haal categorie-metadata op
-        try:
-            all_cats = await sp.categories(limit=50) or []
-        except Exception:
-            all_cats = []
-        cat = next((c for c in all_cats if c.get("id") == category_id), None)
-        if cat is None:
-            # fallback: minimale dict met alleen id
-            cat = {"id": category_id, "name": category_id}
-        tag = (cat.get("name") or category_id).lower()
-        # verwijder 'Music' suffix (Spotify's "Workout Music" → tag "workout")
-        tag = tag.replace(" music", "").strip()
+        # categorie of tag-fallback
+        tag_override: str | None = None
+        if category_id.startswith("tag:"):
+            tag_override = category_id[4:]
+            cat = {"id": category_id, "name": tag_override}
+        else:
+            try:
+                all_cats = await sp.categories(limit=50) or []
+            except Exception:
+                all_cats = []
+            cat = next((c for c in all_cats if c.get("id") == category_id), None)
+            if cat is None:
+                cat = {"id": category_id, "name": category_id}
+        if tag_override is not None:
+            tag = tag_override.lower()
+        else:
+            tag = (cat.get("name") or category_id).lower()
+            # verwijder 'Music' suffix (Spotify's "Workout Music" → tag "workout")
+            tag = tag.replace(" music", "").strip()
         # haal artiesten + playlists
         self._genre_view = view
         try:
