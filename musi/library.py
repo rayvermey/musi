@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS tracks(
     title    TEXT,
     artist   TEXT,
     album    TEXT,
+    genre    TEXT,
     duration REAL DEFAULT 0,
     mtime    REAL DEFAULT 0,
     art_path TEXT
@@ -89,8 +90,8 @@ class ScanResult:
     total: int      # totaal aantal tracks in de library na de scan
 
 
-def _read_tags(path: str) -> tuple[str, str, str, float] | None:
-    """Lees ``(title, artist, album, duration)`` uit een audiobestand via
+def _read_tags(path: str) -> tuple[str, str, str, str, float] | None:
+    """Lees ``(title, artist, album, genre, duration)`` uit een audiobestand via
     mutagen (``easy=True`` voor een eenvoudige tag-view).
 
     Returns:
@@ -114,7 +115,7 @@ def _read_tags(path: str) -> tuple[str, str, str, float] | None:
         return str(v[0]).strip() if isinstance(v, list) else str(v).strip()
 
     duration = float(getattr(mf.info, "length", 0.0) or 0.0)
-    return getv("title"), getv("artist"), getv("album"), duration
+    return getv("title"), getv("artist"), getv("album"), getv("genre"), duration
 
 
 class Library:
@@ -143,6 +144,13 @@ class Library:
         self._lock = threading.RLock()  # reentrant: rescan() roept count() aan o.b.v. dezelfde lock
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migratie: bestaande DB's (van voor de Genre-tab) hebben geen
+            # ``genre``-kolom. ALTER TABLE is idempotent als we 'm conditioneel
+            # maken via PRAGMA. Eerste rescan vult 'm voor alle bestaande tracks.
+            cols = {r["name"] for r in
+                    self._conn.execute("PRAGMA table_info(tracks)").fetchall()}
+            if "genre" not in cols:
+                self._conn.execute("ALTER TABLE tracks ADD COLUMN genre TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -195,19 +203,19 @@ class Library:
                 tags = _read_tags(path)
                 if tags is None:
                     continue
-                title, artist, album, duration = tags
+                title, artist, album, genre, duration = tags
                 if not title:
                     title = os.path.splitext(fn)[0]  # fallback: bestandsnaam zonder ext
 
                 self._conn.execute(
                     """
-                    INSERT INTO tracks(path, title, artist, album, duration, mtime, art_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tracks(path, title, artist, album, genre, duration, mtime, art_path)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path) DO UPDATE SET
                       title=excluded.title, artist=excluded.artist, album=excluded.album,
-                      duration=excluded.duration, mtime=excluded.mtime
+                      genre=excluded.genre, duration=excluded.duration, mtime=excluded.mtime
                     """,
-                    (path, title, artist, album, duration, mtime, path),
+                    (path, title, artist, album, genre, duration, mtime, path),
                 )
                 if row:
                     changed += 1
@@ -238,6 +246,7 @@ class Library:
             title=row["title"] or "(onbekend)",
             artist=row["artist"] or "",
             album=row["album"] or "",
+            genre=row["genre"] or "",
             duration=float(row["duration"] or 0.0),
             art_url=row["art_path"] or "",
         )
@@ -530,6 +539,105 @@ class Library:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM tracks WHERE artist = ? ORDER BY album, path", (artist,)
+            ).fetchall()
+            return [self._row_to_track(r) for r in rows]
+
+    # ---- genre-blader -------------------------------------------------
+    # Voeden de Genre-tab in Library > Lokaal. Tracks zonder genre-tag
+    # verschijnen NIET in de genre-lijsten (zelfde patroon als albums zonder
+    # album-tag in de Albums-tab); ze blijven wel zichtbaar in Nummers/Mappen.
+    def genres(self) -> list[dict]:
+        """Genres met ≥1 track; gegroepeerd op genre-naam, alfabetisch.
+
+        Returns:
+            Lijst van ``{"genre": str, "count": int}``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT genre, COUNT(*) AS c
+                   FROM tracks
+                   WHERE COALESCE(genre, '') != ''
+                   GROUP BY genre
+                   ORDER BY genre"""
+            ).fetchall()
+        return [{"genre": r["genre"], "count": r["c"]} for r in rows]
+
+    def genre_tracks(self, genre: str) -> list[Track]:
+        """Alle tracks van één genre (geordend op artiest, album, pad).
+        Identiek filter als ``album_tracks``/``artist_tracks``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tracks WHERE genre = ? ORDER BY artist, album, path",
+                (genre,),
+            ).fetchall()
+            return [self._row_to_track(r) for r in rows]
+
+    def genre_artists(self, genre: str) -> list[dict]:
+        """Artiesten met ≥1 track in dit genre, met album- + track-count.
+
+        Returns:
+            Lijst van ``{"artist": str, "album_count": int, "track_count": int}``,
+            gesorteerd op artiest. ``album_count`` = unieke albums van deze
+            artiest binnen dit genre (kan albums zonder tag bevatten als ze
+            tracks in dit genre hebben).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT artist,
+                          COUNT(DISTINCT album) AS ac,
+                          COUNT(*) AS tc
+                   FROM tracks
+                   WHERE genre = ? AND COALESCE(artist, '') != ''
+                   GROUP BY artist
+                   ORDER BY artist""",
+                (genre,),
+            ).fetchall()
+        return [{"artist": r["artist"],
+                 "album_count": r["ac"],
+                 "track_count": r["tc"]} for r in rows]
+
+    def genre_albums(self, genre: str) -> list[dict]:
+        """Albums met ≥1 track in dit genre.
+
+        Returns:
+            Lijst van ``{"album": str, "artist": str, "count": int}`` (artist
+            = eerste niet-lege artiest binnen dat album+genre-combinatie).
+            Tracks met lege album-tag vallen weg.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT album, MIN(artist) AS artist, COUNT(*) AS c
+                   FROM tracks
+                   WHERE genre = ? AND COALESCE(album, '') != ''
+                   GROUP BY album
+                   ORDER BY album""",
+                (genre,),
+            ).fetchall()
+        return [{"album": r["album"], "artist": r["artist"] or "",
+                 "count": r["c"]} for r in rows]
+
+    def genre_artist_tracks(self, genre: str, artist: str) -> list[Track]:
+        """Tracks van één artiest binnen één genre. Drill van de Artiesten-
+        sub-tab terug naar de Tracks-sub-tab; 't verschilt van
+        ``artist_tracks`` doordat 't ook filtert op genre."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM tracks
+                   WHERE genre = ? AND artist = ?
+                   ORDER BY album, path""",
+                (genre, artist),
+            ).fetchall()
+            return [self._row_to_track(r) for r in rows]
+
+    def genre_album_tracks(self, genre: str, album: str) -> list[Track]:
+        """Tracks van één album binnen één genre. Drill van de Albums-sub-tab
+        terug naar de Tracks-sub-tab."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM tracks
+                   WHERE genre = ? AND album = ?
+                   ORDER BY path""",
+                (genre, album),
             ).fetchall()
             return [self._row_to_track(r) for r in rows]
 

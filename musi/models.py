@@ -51,6 +51,9 @@ class Track:
         artist: artiest/tenkanaal, mag leeg zijn.
         album: album-naam, mag leeg zijn (lokaal vaak ingevuld; YouTube altijd
             leeg — daar is het "kanaal" de artiest).
+        genre: genre-tag, mag leeg zijn. Voor lokale tracks uit ID3/Vorbis/
+            MP4-tags; YouTube/Spotify laten 'm leeg (niet relevant voor de
+            zoek-bron). De Genre-tab in Library > Lokaal groepeert hierop.
         duration: speelduur in seconden; ``0.0`` = onbekend (UI toont dan "—:—").
         art_url: URL of lokaal pad naar een albumhoes/thumb. Leeg = geen hoes;
             de art-laag (``art.py``) probeert 'm alsnog te vullen.
@@ -65,6 +68,7 @@ class Track:
     title: str
     artist: str = ""
     album: str = ""
+    genre: str = ""        # genre-tag (lokaal uit tags; YT/Spotify leeg)
     duration: float = 0.0  # seconden (0 = onbekend)
     art_url: str = ""      # url/pad voor album-hoes
     extra: dict[str, Any] = field(default_factory=dict)
