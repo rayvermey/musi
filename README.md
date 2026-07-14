@@ -197,3 +197,34 @@ je verzameling vanzelf met wat je beluistert.
   service-implementatie).
 - **Out of scope** (later): SoundCloud/Bandcamp expliciet (vallen al onder
   yt-dlp), last.fm-scrobbling, queue-persistentie, EQ, podcasts.
+
+## Playlist-beheer (Spotify)
+
+Druk op een track-rij in **Zoeken**, **Queue** of in een Library-drill-down
+op `s` om 'm op te slaan in een Spotify-playlist. Er opent een picker met:
+
+- **♡ Liked Songs** — sla direct op in je Liked Songs
+- je eigen en gevolgde playlists — typ om te filteren
+- **+ Nieuwe playlist…** — typ bovenaan een naam en druk Enter; de playlist
+  wordt aangemaakt en het nummer er direct aan toegevoegd
+
+Op een playlist-rij in `#lib-spotify-meta` (Library > Spotify):
+
+- `r` — hernoem de playlist (Input-modal)
+- `D` — verwijder de playlist uit je account (Spotify laat de maker 'm
+  behouden als je 'm alleen volgde)
+
+### Eerste keer na deze update
+
+Bij de eerste save-actie moet je **opnieuw inloggen** via de Spotify-tab in
+musi — Spotify vraagt in de browser om toestemming voor de nieuwe scopes
+(`playlist-modify-public`, `playlist-modify-private`, `user-library-modify`).
+Daarna wordt de nieuwe token automatisch gecached en heb je er geen omkijken
+meer naar.
+
+Als je weet dat OAuth geforceerd is (oude token heeft de oude scopes), kun
+je ook vooraf de cache wissen:
+
+```
+rm ~/.cache/musi/spotify-token.json
+```

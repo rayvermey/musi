@@ -111,6 +111,10 @@ class SpotifySearch(SearchProvider):
                     "playlist-read-private", "playlist-read-collaborative",
                     # playback-start gaat via Web API (MPRIS OpenUri is stuk in spotifyd 0.4.2):
                     "user-modify-playback-state", "user-read-playback-state",
+                    # playlist-CUD + Liked Songs-mutatie (toegevoegd voor
+                    # playlist-beheer; vereist eenmalige browser-re-consent):
+                    "playlist-modify-public", "playlist-modify-private",
+                    "user-library-modify",
                 ]),
             )
             client = spotipy.Spotify(auth_manager=auth)
@@ -308,3 +312,213 @@ class SpotifySearch(SearchProvider):
                 ))
             offset += len(items)
         return out
+
+    # ---- mutaties (playlist-CUD + Liked Songs) -----------------------------
+    # Convention: ``(success: bool, error: str | None)`` — UI kan uniform
+    # dispathen op success/notify bij failure. ``last_error`` wordt gezet op
+    # failure voor parity met de read-methoden.
+
+    async def add_to_saved_tracks(self, uris: list[str]) -> tuple[bool, str | None]:
+        """Voeg tracks toe aan Liked Songs. ``uris`` zijn ``spotify:track:…``."""
+        if not uris:
+            return True, None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            await asyncio.to_thread(partial(self._sp.current_user_saved_tracks_add, uris))
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def remove_from_saved_tracks(self, uris: list[str]) -> tuple[bool, str | None]:
+        """Verwijder tracks uit Liked Songs. Idempotent — niet-aanwezige tracks
+        worden genegeerd door Spotify."""
+        if not uris:
+            return True, None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            await asyncio.to_thread(partial(self._sp.current_user_saved_tracks_delete, uris))
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def create_playlist(self, name: str, public: bool = True,
+                              description: str = "") -> dict | None:
+        """Maak een nieuwe playlist aan voor de ingelogde user. Geeft de verse
+        playlist-dict terug (incl. ``uri``, ``id``, ``name``, ``owner``,
+        ``tracks: {total: 0}``) of ``None`` bij failure.
+
+        ``public=True`` zet 'm op openbaar; met de nieuwe scopes mag dat. Voor
+        private playlists: ``public=False``.
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+        try:
+            # spotipy's ``user_playlist_create`` heeft de user_id als eerste
+            # argument; we gebruiken ``me`` zodat 't bij de ingelogde user komt.
+            user_id = (await asyncio.to_thread(self._sp.current_user))["id"]
+            pl = await asyncio.to_thread(
+                partial(self._sp.user_playlist_create, user_id, name,
+                        public=public, description=description or None)
+            )
+            self.last_error = None
+            return pl
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+
+    async def add_to_playlist(self, playlist_uri: str, uris: list[str]
+                              ) -> tuple[bool, str | None]:
+        """Voeg tracks toe aan een playlist (gegeven als ``spotify:playlist:…``)."""
+        if not uris:
+            return True, None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            await asyncio.to_thread(partial(self._sp.playlist_add_items, playlist_uri, uris))
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def remove_from_playlist(self, playlist_uri: str, uris: list[str]
+                                   ) -> tuple[bool, str | None]:
+        """Verwijder alle occurrences van ``uris`` uit de playlist."""
+        if not uris:
+            return True, None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            await asyncio.to_thread(
+                partial(self._sp.playlist_remove_all_occurrences, playlist_uri, uris)
+            )
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def rename_playlist(self, playlist_uri: str, *, name: str | None = None,
+                              public: bool | None = None) -> tuple[bool, str | None]:
+        """Wijzig playlist-naam en/of public/private. Geef alleen de velden mee
+        die je wilt wijzigen (``None`` = ongewijzigd)."""
+        if name is None and public is None:
+            return True, None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            kwargs: dict[str, object] = {}
+            if name is not None:
+                kwargs["name"] = name
+            if public is not None:
+                kwargs["public"] = public
+            await asyncio.to_thread(
+                partial(self._sp.playlist_change_details, playlist_uri, **kwargs)
+            )
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def delete_playlist(self, playlist_uri: str) -> tuple[bool, str | None]:
+        """Unfollow de playlist — verdwijnt uit de account van de ingelogde user.
+
+        Voor eigen playlists is dit equivalent aan verwijderen. Voor gevolgde
+        playlists van anderen haalt het alleen de follow weg; de playlist zelf
+        blijft bestaan bij de maker.
+        """
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+        try:
+            await asyncio.to_thread(
+                partial(self._sp.current_user_unfollow_playlist, playlist_uri)
+            )
+            self.last_error = None
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+    async def playlist_contains(self, playlist_uri: str, uris: list[str]
+                                ) -> list[bool]:
+        """Voor elk van ``uris``: bepaal of 't in de playlist zit (zelfde volgorde).
+
+        Spotify staat max 100 URIs per call toe; we chunken.
+        """
+        out: list[bool] = []
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        for i in range(0, len(uris), 100):
+            chunk = uris[i:i + 100]
+            try:
+                res = await asyncio.to_thread(
+                    partial(self._sp.playlist_contains, playlist_uri, chunk)
+                )
+            except Exception as e:
+                log.warning("playlist_contains mislukte: %s", e)
+                # failure → conservatief "weet niet" (False) voor alle resterende
+                out.extend([False] * len(chunk))
+                continue
+            # spotipy geeft een list[bool] terug van gelijke lengte als chunk
+            for j, present in enumerate(res):
+                if j < len(out):
+                    out[j] = bool(present)
+                else:
+                    out.append(bool(present))
+            # als res te kort was, vul aan met False
+            while len(out) < i + len(chunk):
+                out.append(False)
+        self.last_error = None
+        return out
+
+    async def saved_track_count(self) -> int:
+        """Aantal Liked Songs. ``current_user_saved_tracks(limit=1)`` is genoeg
+        om het totaal te lezen zonder alles te pagineren."""
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return 0
+        try:
+            res = await asyncio.to_thread(
+                partial(self._sp.current_user_saved_tracks, limit=1)
+            )
+            self.last_error = None
+            return int((res or {}).get("total") or 0)
+        except Exception as e:
+            self.last_error = str(e)
+            return 0

@@ -74,7 +74,7 @@ from ..orchestrator import Orchestrator, PlaybackEvent
 from ..rip import Ripper, video_id
 from ..services import Services
 from .. import art as art_mod
-from ..modals import ConfirmModal, EditTagsModal
+from ..modals import ConfirmModal, EditTagsModal, PlaylistNameModal, PlaylistPickerModal
 
 
 def _fmt_duration(s: float) -> str:
@@ -205,6 +205,9 @@ class SearchPane(Vertical):
         # Enter op en komt play_now nooit aan.
         Binding("enter", "play_now", "Speel/Open", priority=True),
         Binding("a", "add_to_queue", "Toevoegen", priority=False),
+        # Spotify-save: opent de PlaylistPickerModal (Liked Songs / eigen
+        # playlist / nieuwe playlist). Werkt op de resultaten-tabel.
+        Binding("s", "save_to_playlist", "Opslaan"),
     ]
 
     def __init__(self, app: "MusiApp") -> None:
@@ -284,6 +287,22 @@ class SearchPane(Vertical):
             return
         self._app.orchestrator.queue_add(self._app.results[i])
 
+    async def action_save_to_playlist(self) -> None:
+        """`s` op een zoekresultaat: open de picker (Liked Songs / playlist /
+        nieuwe). Alleen zinvol voor Spotify-tracks; lokale/YT-tracks geven een
+        duidelijke notify."""
+        i = self._selected_index()
+        if i is None:
+            return
+        track = self._app.results[i]
+        if track.source != "spotify":
+            self._app.notify(
+                f"Alleen Spotify-tracks zijn savable: '{track.title}' is {track.source}.",
+                severity="warning",
+            )
+            return
+        await self._app.open_save_picker([track.uri], track.title)
+
     def _selected_index(self) -> int | None:
         tbl = self.query_one("#results-table", DataTable)
         if tbl.row_count == 0:
@@ -299,6 +318,16 @@ class QueuePane(Vertical):
     krijgt een ``▶``-markering. ``render_queue`` wordt aangeroepen vanuit de App
     bij elk queue-event."""
 
+    BINDINGS = [
+        # Spotify-save: opent de PlaylistPickerModal (Liked Songs / eigen
+        # playlist / nieuwe playlist). Werkt op de queue-rij.
+        Binding("s", "save_to_playlist", "Opslaan"),
+    ]
+
+    def __init__(self, app: "MusiApp") -> None:
+        super().__init__()
+        self._app = app
+
     def compose(self) -> ComposeResult:
         yield DataTable(id="queue-table", cursor_type="row")
 
@@ -313,6 +342,36 @@ class QueuePane(Vertical):
             mark = "▶" if i == queue.index else " "
             tbl.add_row(f"{mark} {t.badge}", t.title, t.artist,
                         _fmt_duration(t.duration), key=str(i))
+
+    def _selected_index(self) -> int | None:
+        tbl = self.query_one("#queue-table", DataTable)
+        if tbl.row_count == 0:
+            return None
+        try:
+            return int(tbl.coordinate_to_cell_key(
+                tbl.cursor_coordinate).row_key.value)
+        except Exception:
+            return None
+
+    async def action_save_to_playlist(self) -> None:
+        """`s` op een queue-rij: open de picker voor die track (alleen Spotify)."""
+        i = self._selected_index()
+        if i is None:
+            self._app.notify("Geen track in de queue geselecteerd.",
+                             severity="warning")
+            return
+        queue = self._app.orchestrator.queue
+        if i >= len(queue.tracks):
+            return
+        track = queue.tracks[i]
+        if track.source != "spotify":
+            self._app.notify(
+                f"Alleen Spotify-tracks zijn savable "
+                f"('{track.title}' is {track.source}).",
+                severity="warning",
+            )
+            return
+        await self._app.open_save_picker([track.uri], track.title)
 
 
 class LibraryPane(Vertical):
@@ -417,6 +476,12 @@ class LibraryPane(Vertical):
         # YT-playlists worden via youtube.com verwijderd (zie action_delete).
         Binding("e", "edit_tags", "Tags wijzigen"),
         Binding("d", "delete_or_remove", "Verwijderen"),
+        # Spotify-playlist-beheer (track-niveau + playlist-niveau):
+        # `s` op een track-rij → picker (Liked Songs / playlist / nieuwe).
+        # `r` + `D` op een playlist-meta rij → hernoem / verwijder.
+        Binding("s", "save_to_playlist", "Opslaan"),
+        Binding("r", "rename_playlist", "Hernoem playlist"),
+        Binding("D", "delete_playlist", "Verwijder playlist"),
     ]
 
     def __init__(self, app: "MusiApp") -> None:
@@ -943,6 +1008,247 @@ class LibraryPane(Vertical):
         if idx is None:
             return
         self._app.orchestrator.queue_add(self._tracks[idx])
+
+    # ---- playlist-beheer --------------------------------------
+    # `s` op een track-rij → picker (Liked Songs / bestaande playlist / nieuwe).
+    # Focus-dispatch volgt hetzelfde patroon als `action_play_now`: alle
+    # track-tabellen worden afgelopen, en degene die focus heeft wint.
+    async def action_save_to_playlist(self) -> None:
+        track = self._focused_saveable_track()
+        if track is None:
+            self._app.notify(
+                "Selecteer een Spotify-nummer om op te slaan.",
+                severity="warning",
+            )
+            return
+        if track.source != "spotify":
+            self._app.notify(
+                f"Alleen Spotify-tracks zijn savable ('{track.title}' is {track.source}).",
+                severity="warning",
+            )
+            return
+        await self._app.open_save_picker([track.uri], track.title)
+
+    def _focused_saveable_track(self) -> Track | None:
+        """Geef de Track van de gefocuste track-rij in de LibraryPane, of
+        ``None`` als de focus op een meta-tabel of een niet-track-tabel ligt.
+        Doorloopt dezelfde tabellen als ``action_play_now`` (lokaal/folder/
+        albums-detail/artists-detail/genres-detail/spotify-detail/yt-detail).
+        """
+        local = self.query_one("#lib-local-table", DataTable)
+        if local.has_focus:
+            idx = self._row_index(local, "l:")
+            if idx is not None and idx < len(self._local_tracks):
+                return self._local_tracks[idx]
+
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            idx = self._row_index(folders, "f:")
+            if idx is not None and idx < len(self._folder_entries):
+                kind, val = self._folder_entries[idx]
+                if kind == "track":
+                    return val  # type: ignore[return-value]
+
+        alb_detail = self.query_one("#lib-albums-detail", DataTable)
+        if alb_detail.has_focus:
+            idx = self._row_index(alb_detail, "at:")
+            if idx is not None and idx < len(self._album_tracks):
+                return self._album_tracks[idx]
+
+        art_detail = self.query_one("#lib-artists-detail", DataTable)
+        if art_detail.has_focus:
+            idx = self._row_index(art_detail, "rt:")
+            if idx is not None and idx < len(self._artist_tracks):
+                return self._artist_tracks[idx]
+
+        gt = self.query_one("#lib-genres-detail", DataTable)
+        if gt.has_focus and self._genre_view == "tracks":
+            idx = self._row_index(gt, "gt:")
+            if idx is not None and idx < len(self._genre_tracks):
+                return self._genre_tracks[idx]
+
+        detail = self.query_one("#lib-detail-table", DataTable)
+        if detail.has_focus:
+            idx = self._selected_detail_index()
+            if idx is not None and idx < len(self._tracks):
+                return self._tracks[idx]
+
+        yt_detail = self.query_one("#lib-yt-detail", DataTable)
+        if yt_detail.has_focus:
+            idx = self._yt_detail_index()
+            if idx is not None and idx < len(self._tracks):
+                return self._tracks[idx]
+
+        return None
+
+    # `r` op een playlist-meta rij → PlaylistNameModal → sp.rename_playlist.
+    async def action_rename_playlist(self) -> None:
+        sel = self._focused_playlist()
+        if sel is None:
+            self._app.notify(
+                "Selecteer een playlist in #lib-spotify-meta om te hernoemen.",
+                severity="warning",
+            )
+            return
+        uri, name = sel
+        # opslaan context vóór push (zie deadlock-fix in musi-project.md).
+        self._pending_rename_uri = uri
+        self._pending_rename_current = name
+        self._app.push_screen(
+            PlaylistNameModal("Playlist hernoemen", name),
+            callback=self._on_rename_result,
+        )
+
+    def _on_rename_result(self, new_name: str | None) -> None:
+        uri = getattr(self, "_pending_rename_uri", None)
+        self._pending_rename_uri = None
+        cur = getattr(self, "_pending_rename_current", "")
+        self._pending_rename_current = ""
+        if not new_name or uri is None:
+            return
+        if new_name == cur:
+            return
+        asyncio.create_task(self._apply_rename(uri, new_name))
+
+    async def _apply_rename(self, uri: str, new_name: str) -> None:
+        sp = self._app.services.providers.get("spotify")
+        if sp is None:
+            self._app.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        ok, err = await sp.rename_playlist(uri, name=new_name)
+        if not ok:
+            self._app.notify(f"Hernoemen mislukt: {err}", severity="error")
+            return
+        self._app.notify(f"Hernoemd: '{new_name}'")
+        await self._refresh_playlists_after_mutation()
+
+    # `D` op een playlist-meta rij → ConfirmModal → sp.delete_playlist.
+    async def action_delete_playlist(self) -> None:
+        sel = self._focused_playlist()
+        if sel is None:
+            self._app.notify(
+                "Selecteer een playlist in #lib-spotify-meta om te verwijderen.",
+                severity="warning",
+            )
+            return
+        uri, name = sel
+        self._pending_delete_playlist_uri = uri
+        self._pending_delete_playlist_name = name
+        self._app.push_screen(
+            ConfirmModal(
+                "Playlist uit je account verwijderen?",
+                f"“{name}”\n\n"
+                "Voor eigen playlists = wissen. Voor gevolgde playlists "
+                "= unfollow (de maker houdt 'm; jij niet meer)."
+            ),
+            callback=self._on_delete_playlist_confirm,
+        )
+
+    def _on_delete_playlist_confirm(self, ok: bool) -> None:
+        uri = getattr(self, "_pending_delete_playlist_uri", None)
+        name = getattr(self, "_pending_delete_playlist_name", "")
+        self._pending_delete_playlist_uri = None
+        self._pending_delete_playlist_name = ""
+        if not ok or uri is None:
+            return
+        asyncio.create_task(self._apply_delete_playlist(uri, name))
+
+    async def _apply_delete_playlist(self, uri: str, name: str) -> None:
+        sp = self._app.services.providers.get("spotify")
+        if sp is None:
+            self._app.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        ok, err = await sp.delete_playlist(uri)
+        if not ok:
+            self._app.notify(f"Verwijderen mislukt: {err}", severity="error")
+            return
+        self._app.notify(f"Verwijderd: '{name}'")
+        await self._refresh_playlists_after_mutation()
+
+    def _focused_playlist(self) -> tuple[str, str] | None:
+        """Cursor in #lib-spotify-meta op een ``p:<uri>``-rij → (uri, naam).
+        Voor de andere rijen (album-meta, Liked Songs, niets) → ``None``."""
+        meta = self.query_one("#lib-spotify-meta", DataTable)
+        if not meta.has_focus:
+            return None
+        if meta.row_count == 0:
+            return None
+        try:
+            key = meta.coordinate_to_cell_key(
+                meta.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        if not key or not key.startswith("p:"):
+            return None
+        uri = key[2:]
+        # naam uit de cache (gevall de cache is out-of-date, val terug op uri)
+        name = (self._playlists_by_uri.get(uri, {}) or {}).get("name") or uri
+        return uri, name
+
+    async def _refresh_playlists_after_mutation(self) -> None:
+        """Herlaad alleen ``user_playlists()`` na een playlist-CUD — sneller
+        dan de volledige ``refresh_spotify``-route (die ook saved_tracks +
+        albums opnieuw haalt). Update de cache + meta-tabel + hint."""
+        sp = self._app.services.providers.get("spotify")
+        if sp is None:
+            return
+        try:
+            playlists = await sp.user_playlists(limit=100)
+        except Exception as e:
+            log.warning("playlists-refresh na mutatie mislukte: %s", e)
+            return
+        self._playlists_by_uri = {p.get("uri"): p for p in (playlists or [])}
+        mt = self.query_one("#lib-spotify-meta", DataTable)
+        mt.clear()
+        for p in (playlists or []):
+            owner = (p.get("owner") or {}).get("display_name") or "—"
+            mt.add_row(
+                (p.get("name") or "?"), "playlist", owner,
+                key=f"p:{p.get('uri')}",
+            )
+        # albums-rij laten we staan (deze refresh doet alleen playlists);
+        # de albums-meta-rijen staan vóór de playlists in de tabel en worden
+        # door dit stuk code NIET aangeraakt — we renderen alleen de
+        # playlist-rijen opnieuw. Maar mt.clear() gooit alles weg, dus we
+        # zouden albums + Liked Songs verliezen. Daarom: haal ook
+        # saved-albums op als we die eerder laadden.
+        if self._albums_by_uri:
+            try:
+                albums = await sp.saved_albums(limit=100)
+            except Exception:
+                albums = list(self._albums_by_uri.values())
+            self._albums_by_uri = {a.get("uri"): a for a in (albums or [])}
+            # render albums vóór playlists
+            for a in (albums or []):
+                artists = ", ".join(
+                    ar["name"] for ar in a.get("artists") or [])
+                mt.add_row(
+                    (a.get("name") or "?"), "album", artists,
+                    key=f"a:{a.get('uri')}",
+                )
+            # her-render playlists erna
+            for p in (playlists or []):
+                owner = (p.get("owner") or {}).get("display_name") or "—"
+                mt.add_row(
+                    (p.get("name") or "?"), "playlist", owner,
+                    key=f"p:{p.get('uri')}",
+                )
+            # hint
+            saved_count = len(self._local_tracks)  # placeholder; echte counts:
+            # we callen saved_tracks(limit=1) om alleen het totaal te krijgen
+            try:
+                saved_total = await sp.saved_track_count()
+            except Exception:
+                saved_total = 0
+            self.query_one("#lib-spotify-hint", Label).update(
+                f"Liked songs: {saved_total}  ·  Albums: {len(albums or [])}  ·  "
+                f"Playlists: {len(playlists or [])}"
+            )
+        else:
+            # geen albums in cache → alleen playlists tonen, korte hint
+            self.query_one("#lib-spotify-hint", Label).update(
+                f"Playlists: {len(playlists or [])}"
+            )
 
     # ---- tag-editor + delete ------------------------------------
     # `e` op een lokale track-rij → EditTagsModal → mutagen write + DB update.
@@ -1635,6 +1941,98 @@ class MusiApp(App):
             await self.query_one(LibraryPane).refresh_spotify(self)
         except Exception as e:
             self.notify(f"Spotify-library: {e}", severity="warning")
+
+    # ---- playlist-picker (Spotify save) ---------------------------------
+    # ``open_save_picker`` is de single entry-point voor alle 3 de panes
+    # (SearchPane / QueuePane / LibraryPane). Het haalt de SpotifySearch op,
+    # checkt of die er is, en pusht de modal met een dismiss-callback. Per
+    # de modal-deadlock-fix in memory NOOIT ``await push_screen(..., wait_for_dismiss=True)``
+    # vanuit een action — altijd callback-vorm.
+
+    def open_save_picker(self, uris: list[str], title: str) -> None:
+        """Open de PlaylistPickerModal om ``uris`` op te slaan. UI-melding als
+        Spotify niet beschikbaar is."""
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar — check je config / OAuth.",
+                        severity="error")
+            return
+        if not uris:
+            self.notify("Geen tracks om op te slaan.", severity="warning")
+            return
+        self._pending_save_uris = list(uris)
+        self.push_screen(
+            PlaylistPickerModal(sp, title or "(onbekend)"),
+            callback=self._on_picker_result,
+        )
+
+    def _on_picker_result(self, result) -> None:
+        """Dismiss-callback van PlaylistPickerModal. Dispatcht op basis van het
+        resultaat-type en start de zware I/O in een aparte task zodat de
+        dismiss-callback non-blocking terugkeert (consistent met andere
+        modal-callbacks; zie deadlock-fix in memory)."""
+        uris = list(getattr(self, "_pending_save_uris", []) or [])
+        self._pending_save_uris = []
+        if not result or not uris:
+            return
+        kind = result[0]
+        # eerste actie: een directe notify zodat de gebruiker niet wacht op
+        # de trage playlist-refresh. De zware I/O draait op de achtergrond.
+        asyncio.create_task(self._apply_picker_result(kind, result, uris))
+
+    async def _apply_picker_result(self, kind: str, result: tuple, uris: list[str]
+                                   ) -> None:
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        n = len(uris)
+        try:
+            if kind == "liked":
+                ok, err = await sp.add_to_saved_tracks(uris)
+                if not ok:
+                    self.notify(f"Liked Songs mislukt: {err}", severity="error")
+                    return
+                label = "Liked Songs"
+            elif kind == "playlist":
+                uri = result[1]
+                ok, err = await sp.add_to_playlist(uri, uris)
+                if not ok:
+                    self.notify(f"Toevoegen mislukt: {err}", severity="error")
+                    return
+                pl_name = (
+                    self.query_one(LibraryPane)._playlists_by_uri.get(uri, {})
+                    or {}).get("name") or uri
+                label = pl_name
+            elif kind == "new":
+                name = result[1]
+                pl = await sp.create_playlist(name)
+                if pl is None:
+                    self.notify(f"Aanmaken mislukt: {sp.last_error or 'onbekend'}",
+                                severity="error")
+                    return
+                new_uri = pl.get("uri") or ""
+                ok, err = await sp.add_to_playlist(new_uri, uris)
+                if not ok:
+                    self.notify(
+                        f"Playlist aangemaakt, maar nummers toevoegen mislukte: {err}",
+                        severity="error")
+                    return
+                label = name
+            else:
+                self.notify(f"Onbekend picker-resultaat: {kind!r}",
+                            severity="error")
+                return
+        except Exception as e:
+            self.notify(f"Spotify-actie fout: {e}", severity="error")
+            return
+        self.notify(f"{n} nummer(s) toegevoegd aan '{label}'")
+        # Refresh alleen de playlists-rij van het Spotify-tabblad zodat de
+        # nieuwe playlist/track-counts zichtbaar worden. ~300-500ms.
+        try:
+            await self.query_one(LibraryPane)._refresh_playlists_after_mutation()
+        except Exception as e:
+            log.warning("Playlist-refresh na save mislukte: %s", e)
 
     def _on_orch_event(self, ev: PlaybackEvent) -> None:
         if ev.kind == "state" and ev.state is not None:
