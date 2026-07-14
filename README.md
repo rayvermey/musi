@@ -108,11 +108,48 @@ In het zoekveld kun je combinaties van bron- en sorteer-prefixen typen
 |---|---|
 | `/yt` `/youtube` | Alleen YouTube doorzoeken |
 | `/lokaal` `/local` `/l` | Alleen lokale library |
-| `/spotify` `/sp` | Alleen Spotify |
+| `/spotify` `/sp` | Alleen Spotify (tracks + Top-resultaat-kaart) |
+| `/spotify-artiest` `/spotify-artist` | Drill: Spotify-artiest + top-tracks |
+| `/spotify-genre` | Drill: Spotify-categorieën → artiesten/playlists |
 | `!date` `!new` `!nieuw` | YouTube-resultaten sorteren op uploaddatum, nieuwste eerst; toont ook kolommen Datum/Views/Likes |
+| `--limit=N` `limit=N` | Aantal artiesten/playlists voor `/spotify-genre` (1-50, default 20) |
 
 Voorbeelden: `!date lofi` (YouTube+Spotify+local, YT-gesorteerd), `/yt !date coldplay`
 (alleen YouTube, gesorteerd op datum).
+
+#### `/spotify` met Top-resultaat-kaart
+
+`/spotify Herman Brood` toont boven de reguliere 20 tracks een kaart-rij
+met de **artiest** (drill via Enter → top-tracks van die artiest) en het
+**album** (drill via Enter → albumtracks). Track-rijen eronder zijn
+afspeelbaar en savable (druk `s`).
+
+#### `/spotify-artiest <naam>`
+
+`/spotify-artiest Herman Brood` toont de **artiest** als eerste rij +
+diens **10 top-tracks** in de Spotify-markt US. Drill op de artiest-rij
+opent nogmaals de top-tracks (handig na een langere zoekslag).
+
+#### `/spotify-genre <categorie> [--limit=N]`
+
+`/spotify-genre` zonder argument toont **alle** Spotify-categorieën (Rock,
+Hip-Hop, Jazz, …). Met argument filtert het op die naam. Enter op een
+categorie drillt naar een detail-pagina met een view-toggle:
+
+- **Artiesten**: Spotify's `tag:"<genre>"`-search — werkt universeel.
+  Met `--limit=20` (default) krijg je 20 artiesten.
+- **Playlists**: vrij-tekst-`q=<genre>` search — werkt voor populaire
+  categorieën (rock, pop, jazz). Voor obscure tags kan dit leeg zijn.
+
+In de detail-pagina: `A` schakelt naar Artiesten-view, `P` naar
+Playlists-view. Drill op een item-rij (`i:<n>`) opent de artiest of laadt
+de playlist-tracks. Boven de rijen staat een `→ Tab: [A]rtiesten ·
+[P]laylists`-regel waarin je met Enter de view kunt togglen.
+
+**Workaround voor Spotify's verwijderde browse-endpoints**: Spotify heeft
+`category_playlists` (drill-down) eind 2024 deprecated. musi gebruikt
+daarom de playlist-`search` als workaround — voor populaire genres
+(rrock/pop/jazz) levert dat tientallen echte playlists terug.
 
 **Trade-off `!date`**: YouTube's search-extractor geeft geen upload-datum terug
 in de standaard flat-playlist-modus (zelfs non-flat niet). musi lost dat op

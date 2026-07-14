@@ -264,6 +264,136 @@ class SearchPane(Vertical):
                 tbl.add_row(t.badge, t.title, t.artist, _fmt_duration(t.duration),
                             t.source, key=str(i))
 
+    # ---- Spotify-prefix drill-renders -----------------------------------
+    # ``watch_spotify_top_result`` plakt een Top-resultaat-rij boven de
+    # reguliere track-rijen. Rij-key prefixes:
+    #   ``a:<uri>`` = artiest, ``al:<uri>`` = album (drill-keys),
+    #   ``t:<i>``   = echte track (afspeelbaar, savable).
+    # De action-handlers dispatchen op basis van het key-prefix.
+
+    def watch_spotify_top_result(self, query: str, top_artist: dict | None,
+                                 top_album: dict | None,
+                                 tracks: list[Track]) -> None:
+        """Top-resultaat-kaart boven de track-lijst. Bij geen artiest én geen
+        album: val terug op gewone ``watch_results``."""
+        if not top_artist and not top_album:
+            self.watch_results(tracks)
+            return
+        tbl = self.query_one("#results-table", DataTable)
+        cols = self._COLS_PLAIN
+        if list(cols) != getattr(self, "_cols_now", None):
+            self._setup_columns(False)
+        else:
+            tbl.clear()
+        # header-rij met de zoekterm
+        tbl.add_row("", f"🔍 '{query}'", "", "", "Top-resultaat",
+                    key="h:top")
+        # artiest-rij (drill-key)
+        if top_artist is not None:
+            artist_name = top_artist.get("name") or "?"
+            followers = top_artist.get("followers", {}).get("total") or 0
+            genres = (top_artist.get("genres") or [])[:2]
+            tbl.add_row(
+                "🎤", artist_name,
+                f"{followers:,} volgers" + (f" · {', '.join(genres)}" if genres else ""),
+                "", "artiest", key=f"a:{top_artist.get('uri', '')}",
+            )
+        # album-rij (drill-key)
+        if top_album is not None:
+            alb_name = top_album.get("name") or "?"
+            alb_artists = ", ".join(a["name"] for a in (top_album.get("artists") or []))
+            yr = (top_album.get("release_date") or "")[:4]
+            tbl.add_row(
+                "💿", alb_name, alb_artists, yr or "—", "album",
+                key=f"al:{top_album.get('uri', '')}",
+            )
+        # tracks onder de kaart (zoals normaal, maar met prefix t:)
+        for i, t in enumerate(tracks):
+            tbl.add_row(t.badge, t.title, t.artist,
+                        _fmt_duration(t.duration), t.source, key=f"t:{i}")
+
+    def watch_artist_top(self, artist: dict, top_tracks: list[Track]) -> None:
+        """Render de top-tracks van een artiest (gevolg op /spotify-artiest).
+        Eerste rij is een drill-key voor de artiest-detail; rijen 1+ zijn
+        tracks. De artiest is ook beschikbaar als pseudo-row met key
+        ``a:<uri>`` zodat de gebruiker 'm in een later stadium kan drillen."""
+        tbl = self.query_one("#results-table", DataTable)
+        if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
+            self._setup_columns(False)
+        else:
+            tbl.clear()
+        name = artist.get("name") or "?"
+        followers = artist.get("followers", {}).get("total") or 0
+        genres = (artist.get("genres") or [])[:3]
+        tbl.add_row(
+            "🎤", name,
+            f"{followers:,} volgers" + (f" · {', '.join(genres)}" if genres else ""),
+            "", "artiest (drill)", key=f"a:{artist.get('uri', '')}",
+        )
+        for i, t in enumerate(top_tracks):
+            tbl.add_row(t.badge, t.title, t.artist,
+                        _fmt_duration(t.duration), t.source, key=f"t:{i}")
+
+    def watch_genre_categories(self, query: str,
+                               categories: list[dict]) -> None:
+        """Render Spotify's top-level genre-categorieën in de resultaten-tabel.
+        Rij-keys zijn ``g:<id>`` (drill-keys)."""
+        tbl = self.query_one("#results-table", DataTable)
+        if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
+            self._setup_columns(False)
+        else:
+            tbl.clear()
+        tbl.add_row("", f"🎵 Spotify-categorieën"
+                     f"{' (filter: ' + query + ')' if query else ''}",
+                     "", "", "kies een categorie", key="h:cat")
+        for c in categories:
+            tbl.add_row("📁", c.get("name") or "?",
+                        c.get("id") or "", "", "categorie (drill)",
+                        key=f"g:{c.get('id', '')}")
+
+    def watch_genre_detail(self, category: dict, kind: str,
+                            items: list, header: str = "") -> None:
+        """Render een genre-detail-pagina (artiesten óf playlists). Rij-keys:
+        ``i:<index>`` (afspeelbaar als Track) of speciale keys voor de
+        categorie-header en view-selector.
+
+        ``kind`` is ``"artists"`` of ``"playlists"``.
+        """
+        tbl = self.query_one("#results-table", DataTable)
+        if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
+            self._setup_columns(False)
+        else:
+            tbl.clear()
+        cat_name = category.get("name") or "?"
+        view = "Artiesten" if kind == "artists" else "Playlists"
+        tbl.add_row("", f"🎵 {cat_name} — {view}"
+                     + (f"  ·  {header}" if header else ""),
+                     "", "", "drill of speel",
+                     key="h:gd")
+        # View-toggle: 2 speciale rijen (druk 'a' voor artiesten, 'p' voor playlists)
+        tbl.add_row("", "→ Tab: [A]rtiesten · [P]laylists",
+                     "", "", "view-toggle", key="v:toggle")
+        for i, it in enumerate(items):
+            if kind == "artists":
+                tbl.add_row(
+                    "🎤",
+                    it.get("name") or "?",
+                    f"{(it.get('followers') or {}).get('total', 0):,} volgers",
+                    "", "artiest (drill)",
+                    key=f"i:{i}",
+                )
+            else:
+                # playlist-dict met images + owner
+                owner = ((it.get("owner") or {}).get("display_name")) or "—"
+                tracks_total = (it.get("tracks") or {}).get("total") or 0
+                tbl.add_row(
+                    "💿",
+                    it.get("name") or "?",
+                    f"{owner} · {tracks_total} tracks",
+                    "", "playlist (drill)",
+                    key=f"i:{i}",
+                )
+
     async def action_play_now(self) -> None:
         # priority=True op deze Enter-binding onderschept Enter óók als de
         # zoek-Input focus heeft — Input.Submitted wordt daarmee geblokkeerd
@@ -275,11 +405,46 @@ class SearchPane(Vertical):
         if si.has_focus:
             await self._app._on_search_submit(si.value)
             return
-        i = self._selected_index()
-        if i is None:
+        # dispatch op rij-key-prefix:
+        #   t:<i>        → echte track afspelen
+        #   a:<uri>      → Spotify-artiest drillen
+        #   al:<uri>     → Spotify-album drillen
+        #   g:<id>       → genre-categorie drillen
+        #   v:toggle     → view-switch in genre-detail
+        #   i:<n>        → item in genre-detail
+        #   h:*          → header-rij, doe niets
+        key = self._selected_key()
+        if key is None:
             return
-        results: list[Track] = self._app.results
-        await self._app.play_track(results[i])
+        if key.startswith("h:"):
+            return  # header-rij, geen actie
+        if key.startswith("a:"):
+            asyncio.create_task(self._app._open_spotify_artist_by_uri(key[2:]))
+            return
+        if key.startswith("al:"):
+            asyncio.create_task(self._app._open_spotify_album_by_uri(key[3:]))
+            return
+        if key.startswith("g:"):
+            view = getattr(self._app, "_genre_view", "artists")
+            asyncio.create_task(self._app._open_spotify_genre_detail(
+                key[2:], view=view))
+            return
+        if key == "v:toggle":
+            asyncio.create_task(self._app._toggle_genre_detail_view())
+            return
+        if key.startswith("i:"):
+            try:
+                idx = int(key[2:])
+            except ValueError:
+                return
+            asyncio.create_task(self._app._open_genre_detail_item(idx))
+            return
+        # fallback: oude numerieke key (zoekresultaten zonder prefix)
+        if key.isdigit():
+            i = int(key)
+            results: list[Track] = self._app.results
+            if i < len(results):
+                await self._app.play_track(results[i])
 
     async def action_add_to_queue(self) -> None:
         i = self._selected_index()
@@ -290,11 +455,25 @@ class SearchPane(Vertical):
     async def action_save_to_playlist(self) -> None:
         """`s` op een zoekresultaat: open de picker (Liked Songs / playlist /
         nieuwe). Alleen zinvol voor Spotify-tracks; lokale/YT-tracks geven een
-        duidelijke notify."""
-        i = self._selected_index()
-        if i is None:
+        duidelijke notify.
+
+        Werkt op de top-resultaat-kaart (track-key ``t:<i>``) en op de
+        artiest-top-tracks. Skip alle drill-keys (artiest/album/genre)."""
+        key = self._selected_key()
+        if key is None or not key.startswith("t:"):
+            self._app.notify(
+                "Selecteer een afspeelbaar Spotify-nummer (geen drill-rij).",
+                severity="warning",
+            )
             return
-        track = self._app.results[i]
+        try:
+            i = int(key[2:])
+        except ValueError:
+            return
+        results: list[Track] = self._app.results
+        if i >= len(results):
+            return
+        track = results[i]
         if track.source != "spotify":
             self._app.notify(
                 f"Alleen Spotify-tracks zijn savable: '{track.title}' is {track.source}.",
@@ -304,11 +483,30 @@ class SearchPane(Vertical):
         self._app.open_save_picker([track.uri], track.title)
 
     def _selected_index(self) -> int | None:
+        """Achterwaartse compat: geeft de int-index terug van een ``t:<i>``-
+        of pure-numerieke key. Voor de nieuwe dispatch gebruik je
+        ``_selected_key``."""
+        key = self._selected_key()
+        if key is None:
+            return None
+        if key.startswith("t:"):
+            try:
+                return int(key[2:])
+            except ValueError:
+                return None
+        if key.isdigit():
+            try:
+                return int(key)
+            except ValueError:
+                return None
+        return None
+
+    def _selected_key(self) -> str | None:
         tbl = self.query_one("#results-table", DataTable)
         if tbl.row_count == 0:
             return None
         try:
-            return int(tbl.coordinate_to_cell_key(tbl.cursor_coordinate).row_key.value)
+            return tbl.coordinate_to_cell_key(tbl.cursor_coordinate).row_key.value
         except Exception:
             return None
 
@@ -2116,14 +2314,19 @@ class MusiApp(App):
         label = self.query_one("#search-source-label", Label)
         label.update("zoeken…")
         # Token-gebaseerd parsen van bron-prefix (``/yt`` …) én sort-flag
-        # (``/date``/``!date`` …). Beide mogen op elke positie en in willekeurige
-        # volgorde staan — "/yt /date lofi", "/date /yt lofi" en "!date /yt lofi"
-        # werken allemaal. We strippen de herkende tokens eruit; wat overblijft
-        # is de zoekterm (originele casing behouden).
+        # (``/date``/``!date`` …) én ``--limit=N`` (Spotify-specifiek). Beide
+        # mogen op elke positie en in willekeurige volgorde staan — "/yt /date
+        # lofi", "/date /yt lofi" en "!date /yt lofi" werken allemaal. We
+        # strippen de herkende tokens eruit; wat overblijft is de zoekterm
+        # (originele casing behouden).
         SOURCE_PREFIX = {
             "/yt": "youtube", "/youtube": "youtube",
             "/lokaal": "local", "/local": "local", "/l": "local",
             "/spotify": "spotify", "/sp": "spotify",
+            # Drill-prefixes (Spotify-specifiek): openen een aparte flow,
+            # geen reguliere track-search.
+            "/spotify-artiest": "spotify-artist", "/spotify-artist": "spotify-artist",
+            "/spotify-genre": "spotify-genre",
         }
         SORT_FLAGS = {
             "!date": "date", "/date": "date",
@@ -2132,6 +2335,7 @@ class MusiApp(App):
         }
         source: str | None = None
         sort = "relevance"
+        spotify_limit: int | None = None
         kept: list[str] = []
         for tok in query.split():
             low = tok.lower()
@@ -2141,10 +2345,27 @@ class MusiApp(App):
                 # dubbele bron-prefix negeren (niet als zoekterm gebruiken)
             elif low in SORT_FLAGS:
                 sort = SORT_FLAGS[low]
+            elif low.startswith("--limit=") or low.startswith("limit="):
+                # ``--limit=50`` of ``limit=50`` — alleen voor Spotify-flows.
+                val = low.split("=", 1)[1]
+                try:
+                    spotify_limit = max(1, min(50, int(val)))
+                except ValueError:
+                    pass
             else:
                 kept.append(tok)
         query = " ".join(kept)
         if not query:
+            return
+        # Speciale drill-prefixes: openen hun eigen UI-flow in plaats van een
+        # reguliere zoekactie.
+        if source == "spotify-artist":
+            asyncio.create_task(self._open_spotify_artist(query))
+            label.update(f"bron: spotify-artiest · {query}")
+            return
+        if source == "spotify-genre":
+            asyncio.create_task(self._open_spotify_genre(query, spotify_limit or 20))
+            label.update(f"bron: spotify-genre · {query} · limit={spotify_limit or 20}")
             return
         # "datum" yt-dlp laat elke video resolv'en (flat-playlist levert geen
         # upload-timestamp); ~30-60s voor 20 resultaten. Waarschuw de gebruiker
@@ -2160,14 +2381,17 @@ class MusiApp(App):
         if source in (None, "youtube"):
             tasks["youtube"] = sel["youtube"].search(query, limit=15, sort=sort)
         if source in (None, "spotify") and "spotify" in sel:
-            tasks["spotify"] = sel["spotify"].search(query, limit=20)
+            tasks["spotify"] = sel["spotify"].search(query, limit=spotify_limit or 20)
         names = list(tasks.keys())
         got = await asyncio.gather(*[tasks[n] for n in names])
         by_source = dict(zip(names, got))
-        # volgorde: lokaal → youtube → spotify
-        results = (by_source.get("local", []) + by_source.get("youtube", [])
-                   + by_source.get("spotify", []))
-        self.results = results
+        # volgorde: lokaal → youtube → spotify. Voor Spotify met
+        # ``search_all`` (Top-resultaat-kaart): we vervangen de gewone
+        # ``search``-call door ``search_all`` en voegen de top-result-rij
+        # vooraf.
+        self.results = results = (by_source.get("local", [])
+                                  + by_source.get("youtube", [])
+                                  + by_source.get("spotify", []))
         bron = source or "alle"
         delen = " · ".join(f"{len(by_source.get(n, []))} {n}" for n in names)
         sort_txt = " · sort: datum" if sort == "date" else ""
@@ -2175,7 +2399,275 @@ class MusiApp(App):
         # Extra Datum/Views/Likes-kolommen tonen bij ``!date`` (alleen dáár
         # heeft YouTube die data opgehaald — andere modi zouden de kolommen
         # altijd leeg tonen).
-        self.query_one(SearchPane).watch_results(results, show_stats=(sort == "date"))
+        show_stats = (sort == "date")
+        if source == "spotify" and "spotify" in sel and not show_stats:
+            # Top-resultaat-kaart-flow: extra rij boven de tracks.
+            asyncio.create_task(self._spotify_search_with_top_result(
+                query, results, spotify_limit or 20))
+            return
+        self.query_one(SearchPane).watch_results(results, show_stats=show_stats)
+
+    async def _spotify_search_with_top_result(self, query: str,
+                                              tracks: list, limit: int) -> None:
+        """Haalt een extra ``search_all`` om de Top-resultaat-kaart-rij boven
+        de bestaande tracks te tonen. Bij lege artiest-/album-resultaten
+        gedragen we ons als een gewone track-search (graceful fallback)."""
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.query_one(SearchPane).watch_results(tracks)
+            return
+        try:
+            res = await sp.search_all(query, limit=limit)
+        except Exception as e:
+            log.warning("search_all mislukte: %s", e)
+            self.query_one(SearchPane).watch_results(tracks)
+            return
+        # plak de top-result-rij aan de tracks-tabel vast. De top-rij is
+        # een pseudo-Track met source=='spotify-top' zodat de rest van de
+        # UI 'm kan onderscheiden van echte tracks.
+        top_artist = (res.get("artists") or [None])[0]
+        top_album = (res.get("albums") or [None])[0]
+        # render via SearchPane — helper hieronder laat de SearchPane de
+        # top-rij tonen boven de tracks.
+        try:
+            self.query_one(SearchPane).watch_spotify_top_result(
+                query, top_artist, top_album, tracks)
+        except AttributeError:
+            # SearchPane heeft de helper nog niet; toon alleen tracks.
+            self.query_one(SearchPane).watch_results(tracks)
+
+    async def _open_spotify_artist(self, query: str) -> None:
+        """``/spotify-artiest <naam>`` — toont Top-artiest in de resultaten +
+        10 top-tracks van die artiest onder elkaar (in de track-tabel,
+        afspeelbaar). Drill op Enter: zie action_play_now."""
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        try:
+            res = await sp.search_all(query, limit=5)
+        except Exception as e:
+            self.notify(f"Spotify-artiest-zoek mislukt: {e}", severity="error")
+            return
+        top_artist = (res.get("artists") or [None])[0]
+        if top_artist is None:
+            self.notify(f"Geen artiest gevonden voor '{query}'.",
+                        severity="warning")
+            return
+        # haal top-tracks op (≤10, market US — kan uitgebreid worden)
+        try:
+            top_tracks = await sp.artist_top_tracks(top_artist["id"])
+        except Exception as e:
+            self.notify(f"Top-tracks mislukt: {e}", severity="warning")
+            top_tracks = []
+        # Zet ze als pseudo-Track in de resultaten-tabel
+        from ..search.spotify import _to_track
+        track_objs = [_to_track(t) for t in (top_tracks or [])]
+        # toon via SearchPane: pseudo-artiest-rij + tracks
+        try:
+            self.query_one(SearchPane).watch_artist_top(
+                top_artist, track_objs)
+        except AttributeError:
+            self.query_one(SearchPane).watch_results(track_objs)
+
+    async def _open_spotify_genre(self, query: str, limit: int) -> None:
+        """``/spotify-genre <naam> [--limit=N]`` — toont Spotify's top-level
+        categorieën die matchen op ``query``. Enter op een categorie drillt
+        naar het detail-scherm met twee sub-tabs (Artiesten / Playlists).
+
+        Bij lege ``query`` tonen we alle categorieën.
+        """
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        try:
+            cats = await sp.categories(limit=50)
+        except Exception as e:
+            self.notify(f"Genre-categorieën mislukt: {e}", severity="error")
+            return
+        if not cats:
+            self.notify("Spotify-categorieën niet beschikbaar.", severity="warning")
+            return
+        # filter op query als die niet leeg is
+        q = (query or "").strip().lower()
+        if q:
+            cats = [c for c in cats if q in (c.get("name") or "").lower()]
+        if not cats:
+            self.notify(f"Geen categorieën gevonden voor '{query}'.",
+                        severity="warning")
+            return
+        try:
+            self.query_one(SearchPane).watch_genre_categories(query, cats)
+        except AttributeError:
+            self.notify("Genre-categorieën weergave niet geïmplementeerd.",
+                        severity="warning")
+
+    # ---- drill-helpers (gebruikt door SearchPane row-key-dispatch) ------
+    # ``_selected_key`` in SearchPane geeft een rij-key terug; afhankelijk
+    # van het prefix (``a:`` / ``al:`` / ``g:`` / ``i:``) roept deze methoden
+    # aan om door te drillen of de view te switchen. Bij foutmelding tonen
+    # we via ``self.notify`` zodat de gebruiker niet naar logs hoeft te kijken.
+
+    async def _open_spotify_artist_by_uri(self, uri_or_id: str) -> None:
+        """Drill op een artiest-rij in de Search-resultaten: haalt de artiest
+        + top-tracks en rendert ze via ``watch_artist_top``. ``uri_or_id`` is
+        een ``spotify:artist:<id>`` URI of kale hex-ID."""
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        try:
+            artist = await sp.artist(uri_or_id)
+        except Exception as e:
+            self.notify(f"Artiest ophalen mislukt: {e}", severity="error")
+            return
+        if not artist:
+            self.notify("Artiest niet gevonden.", severity="warning")
+            return
+        try:
+            top = await sp.artist_top_tracks(artist["id"])
+        except Exception as e:
+            self.notify(f"Top-tracks mislukt: {e}", severity="warning")
+            top = []
+        from ..search.spotify import _to_track
+        track_objs = [_to_track(t) for t in (top or []) if t]
+        try:
+            self.query_one(SearchPane).watch_artist_top(artist, track_objs)
+            # sla de artiest op in app-state zodat ``_open_spotify_album_by_uri``
+            # weet welke artiest we aan het drillen zijn.
+            self._current_drill_artist = artist
+            self.results = track_objs
+            label = self.query_one("#search-source-label", Label)
+            label.update(f"bron: spotify-artiest · {artist.get('name', '?')}")
+        except Exception as e:
+            self.notify(f"Render-fout: {e}", severity="error")
+
+    async def _open_spotify_album_by_uri(self, uri_or_id: str) -> None:
+        """Drill op een album-rij: haalt het album + alle tracks en rendert
+        ze als reguliere tracks. Voor het gemak converteren we album-tracks
+        via ``_to_track`` met de albumhoes als ``art_url``."""
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        try:
+            alb = await sp.album_full(uri_or_id)
+            if alb is None:
+                self.notify("Album niet gevonden.", severity="warning")
+                return
+            tracks = await sp.album_tracks(
+                alb.get("uri", ""), limit=200,
+                art_url=_art_from_collection(alb))
+        except Exception as e:
+            self.notify(f"Album ophalen mislukt: {e}", severity="error")
+            return
+        if not tracks:
+            self.notify("Album heeft geen afspeelbare tracks.",
+                        severity="warning")
+            return
+        self.results = tracks
+        self.query_one(SearchPane).watch_results(tracks)
+        label = self.query_one("#search-source-label", Label)
+        label.update(
+            f"bron: spotify-album · {alb.get('name', '?')} · {len(tracks)} tracks")
+
+    async def _open_spotify_genre_detail(self, category_id: str,
+                                         view: str = "artists") -> None:
+        """Drill in een genre-categorie: haal artiesten (via tag-search) en
+        playlists (via vrij-tekst-search) en render ze in de sub-tab.
+
+        ``view`` bepaalt welke subset meteen zichtbaar is (``artists`` of
+        ``playlists``). De app-scope ``self._genre_view`` onthoudt de
+        gekozen view voor latere toggle-actie.
+        """
+        sp = self.services.providers.get("spotify")
+        if sp is None:
+            self.notify("Spotify niet beschikbaar.", severity="error")
+            return
+        # haal categorie-metadata op
+        try:
+            all_cats = await sp.categories(limit=50) or []
+        except Exception:
+            all_cats = []
+        cat = next((c for c in all_cats if c.get("id") == category_id), None)
+        if cat is None:
+            # fallback: minimale dict met alleen id
+            cat = {"id": category_id, "name": category_id}
+        tag = (cat.get("name") or category_id).lower()
+        # verwijder 'Music' suffix (Spotify's "Workout Music" → tag "workout")
+        tag = tag.replace(" music", "").strip()
+        # haal artiesten + playlists
+        self._genre_view = view
+        try:
+            if view == "artists":
+                items = await sp.search_artists_by_tag(tag, limit=20)
+                kind = "artists"
+            else:
+                items = await sp.search_playlists_by_tag(tag, limit=20)
+                kind = "playlists"
+        except Exception as e:
+            self.notify(f"Genre-detail mislukt: {e}", severity="error")
+            return
+        # filter None-items (Spotify geeft soms None terug in playlists)
+        items = [x for x in (items or []) if x]
+        self._genre_pending = (cat, kind, items)
+        try:
+            self.query_one(SearchPane).watch_genre_detail(
+                cat, kind, items,
+                header=f"{len(items)} {kind} voor '{cat.get('name', '?')}'")
+            label = self.query_one("#search-source-label", Label)
+            label.update(f"bron: spotify-genre · {cat.get('name', '?')} · {kind}")
+        except Exception as e:
+            self.notify(f"Render-fout: {e}", severity="error")
+
+    async def _toggle_genre_detail_view(self) -> None:
+        """Toggle tussen Artiesten / Playlists in een genre-detail-pagina."""
+        view = getattr(self, "_genre_view", "artists")
+        pending = getattr(self, "_genre_pending", None)
+        if pending is None:
+            return
+        new_view = "playlists" if view == "artists" else "artists"
+        cat, _, _ = pending
+        await self._open_spotify_genre_detail(cat.get("id", ""), view=new_view)
+
+    async def _open_genre_detail_item(self, idx: int) -> None:
+        """Drill op een item-rij in de genre-detail-pagina (afhankelijk van
+        de huidige view): bij ``artists`` → drill naar artiest;
+        bij ``playlists`` → drill naar playlist (laad tracks en render)."""
+        pending = getattr(self, "_genre_pending", None)
+        if pending is None:
+            return
+        cat, kind, items = pending
+        if idx >= len(items):
+            return
+        item = items[idx]
+        if kind == "artists":
+            uri = item.get("uri") or item.get("id") or ""
+            await self._open_spotify_artist_by_uri(uri)
+        else:
+            uri = item.get("uri") or ""
+            if not uri:
+                self.notify("Geen playlist-URI.", severity="warning")
+                return
+            sp = self.services.providers.get("spotify")
+            if sp is None:
+                self.notify("Spotify niet beschikbaar.", severity="error")
+                return
+            try:
+                tracks = await sp.playlist_tracks(uri, limit=200)
+            except Exception as e:
+                self.notify(f"Playlist-tracks mislukt: {e}", severity="error")
+                return
+            tracks = [t for t in (tracks or []) if t]
+            if not tracks:
+                self.notify("Playlist is leeg.", severity="warning")
+                return
+            self.results = tracks
+            self.query_one(SearchPane).watch_results(tracks)
+            label = self.query_one("#search-source-label", Label)
+            label.update(
+                f"bron: spotify-playlist · {item.get('name', '?')} · {len(tracks)} tracks")
 
     async def play_track(self, track: Track) -> None:
         # wis de queue en begin met deze track, of voeg toe aan queue?

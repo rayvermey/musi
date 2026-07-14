@@ -522,3 +522,248 @@ class SpotifySearch(SearchProvider):
         except Exception as e:
             self.last_error = str(e)
             return 0
+
+    # ---- artiest + album + genre ----------------------------------------
+    # Alle read-methoden voor de nieuwe zoekflows (``/spotify`` Top-resultaat,
+    # ``/spotify-artiest``, ``/spotify-genre``). Geen mutaties hier — die
+    # zitten in de playlist-sectie hierboven.
+
+    async def search_all(self, query: str, limit: int = 20
+                         ) -> dict[str, Any]:
+        """Multi-type zoek (track + artist + album) voor de Top-resultaat-kaart
+        in ``/spotify``. Geeft ``{"tracks": [...], "artists": [...], "albums": [...]}``
+        terug; elk lijst-element is een onbewerkte Spotify-dict (de UI haalt
+        er een badge/cover/naam uit). Bij één lege subset is dat geen
+        failure — alleen de collectieve ``last_error`` wordt op None gezet
+        bij success.
+        """
+        query = (query or "").strip()
+        if not query:
+            return {"tracks": [], "artists": [], "albums": []}
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return {"tracks": [], "artists": [], "albums": []}
+        try:
+            res = await asyncio.to_thread(partial(
+                self._sp.search, q=query, type="track,artist,album",
+                limit=limit))
+            self.last_error = None
+        except Exception as e:
+            self.last_error = str(e)
+            return {"tracks": [], "artists": [], "albums": []}
+        return {
+            "tracks": (res or {}).get("tracks", {}).get("items") or [],
+            "artists": (res or {}).get("artists", {}).get("items") or [],
+            "albums": (res or {}).get("albums", {}).get("items") or [],
+        }
+
+    async def artist(self, artist_id_or_uri: str) -> dict[str, Any] | None:
+        """Haal één artiest op (dict met o.a. ``name``, ``followers``,
+        ``images``, ``genres``, ``popularity``). Geeft None bij fout/missing.
+        Accepteert zowel bare IDs (``0OdUWJ0sBjDrqHygGUXeCF``) als URIs
+        (``spotify:artist:0OdUWJ0sBjDrqHygGUXeCF``)."""
+        artist_id = self._strip_uri(artist_id_or_uri, "artist")
+        if not artist_id:
+            return None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+        try:
+            res = await asyncio.to_thread(partial(self._sp.artist, artist_id))
+            self.last_error = None
+            return res
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+
+    async def artist_top_tracks(self, artist_id_or_uri: str,
+                                 market: str = "US") -> list[dict[str, Any]]:
+        """Spotify's 'Top tracks' (≤10) voor een artiest in een bepaalde markt.
+        Geeft een lijst track-dicts terug (geschikt voor ``_to_track``)."""
+        artist_id = self._strip_uri(artist_id_or_uri, "artist")
+        if not artist_id:
+            return []
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        try:
+            res = await asyncio.to_thread(partial(
+                self._sp.artist_top_tracks, artist_id, country=market))
+            self.last_error = None
+            return (res or {}).get("tracks") or []
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+
+    async def artist_albums(self, artist_id_or_uri: str, limit: int = 50,
+                            groups: str = "album,single,compilation"
+                            ) -> list[dict[str, Any]]:
+        """Albums/singles/compilaties van een artiest. ``groups`` bepaalt welke
+        album-typen worden meegenomen; standaard alles behalve 'appears_on'.
+
+        Geeft een lijst album-dicts terug (volledig; voor o.a. cover-URLs).
+        Wordt gepagineerd tot ``limit`` of tot Spotify stopt.
+        """
+        artist_id = self._strip_uri(artist_id_or_uri, "artist")
+        if not artist_id:
+            return []
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        out: list[dict[str, Any]] = []
+        offset = 0
+        page = min(50, limit)
+        while offset < limit:
+            try:
+                res = await asyncio.to_thread(partial(
+                    self._sp.artist_albums, artist_id,
+                    include_groups=groups, limit=page, offset=offset))
+                self.last_error = None
+            except Exception as e:
+                self.last_error = str(e)
+                break
+            items = (res or {}).get("items") or []
+            if not items:
+                break
+            out.extend(items)
+            offset += len(items)
+            if len(items) < page:
+                break
+        return out
+
+    async def album_full(self, album_id_or_uri: str) -> dict[str, Any] | None:
+        """Haal één album op incl. tracks, label, release-datum, cover.
+        Geeft None bij fout/missing.
+
+        Accepteert zowel bare ID als ``spotify:album:…`` URI.
+        """
+        album_id = self._strip_uri(album_id_or_uri, "album")
+        if not album_id:
+            return None
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+        try:
+            res = await asyncio.to_thread(partial(self._sp.album, album_id))
+            self.last_error = None
+            return res
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+
+    async def categories(self, country: str = "US", limit: int = 50
+                         ) -> list[dict[str, Any]]:
+        """Spotify's top-level genre-categorieën ('Rock', 'Hip-Hop', 'Workout',
+        …). Geeft een lijst van category-dicts terug (``id``, ``name``,
+        ``icons``). Locale-gevoelig; default US.
+
+        Houd er rekening mee dat ``category_playlists`` (drill-down) door
+        Spotify is verwijderd (404 vanaf eind 2024); we doen de
+        drill-down via ``search_playlists_by_tag`` (zie hieronder) op de
+        category-naam of -slug als tag.
+        """
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        out: list[dict[str, Any]] = []
+        offset = 0
+        page = min(50, limit)
+        while offset < limit:
+            try:
+                res = await asyncio.to_thread(partial(
+                    self._sp.categories, country=country,
+                    limit=page, offset=offset))
+                self.last_error = None
+            except Exception as e:
+                self.last_error = str(e)
+                break
+            items = ((res or {}).get("categories") or {}).get("items") or []
+            if not items:
+                break
+            out.extend(items)
+            offset += len(items)
+            if len(items) < page:
+                break
+        return out
+
+    async def search_playlists_by_tag(self, tag: str, limit: int = 20
+                                      ) -> list[dict[str, Any]]:
+        """Zoek playlists die getagd zijn met ``tag`` — Spotify's
+        playlist-search accepteert de query-tag (bv. ``q='rock'``). Geeft
+        playlist-dicts terug (volledig, incl. images).
+
+        Dit is de workaround voor de door Spotify verwijderde
+        ``category_playlists``-endpoint: we gebruiken een vrij-tekst-query
+        op de category-naam (bv. ``rock``, ``hip-hop``, ``jazz``).
+        """
+        tag = (tag or "").strip().strip('"')
+        if not tag:
+            return []
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        try:
+            res = await asyncio.to_thread(partial(
+                self._sp.search, q=tag, type="playlist", limit=limit))
+            self.last_error = None
+            return ((res or {}).get("playlists") or {}).get("items") or []
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+
+    async def search_artists_by_tag(self, tag: str, limit: int = 20
+                                    ) -> list[dict[str, Any]]:
+        """Zoek artiesten die getagd zijn met ``tag`` — Spotify staat de
+        speciale query ``tag:"rock"`` (universeler dan ``genre:``) toe in
+        de artist-search. Geeft een lijst artist-dicts terug (volledig;
+        voor o.a. cover-URLs).
+
+        ``tag`` is een losse tag-string ('rock', 'jazz', 'dutch', etc.).
+        Werkt voor tags die Spotify ook als artiest-tag kent (anders
+        lege lijst).
+        """
+        tag = (tag or "").strip().strip('"')
+        if not tag:
+            return []
+        q = f'tag:"{tag}"'
+        try:
+            await asyncio.to_thread(self._ensure_client)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        try:
+            res = await asyncio.to_thread(partial(
+                self._sp.search, q=q, type="artist", limit=limit))
+            self.last_error = None
+            return ((res or {}).get("artists") or {}).get("items") or []
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+
+    @staticmethod
+    def _strip_uri(value: str, kind: str) -> str:
+        """Helper: haal de ID uit een Spotify-URI (``spotify:<kind>:<id>``) of
+        geef de waarde ongewijzigd terug als die geen URI-patroon matcht.
+        ``kind`` is 'artist', 'album', 'playlist', of 'track' (ter info —
+        niet gebruikt voor validatie)."""
+        if not value:
+            return ""
+        if value.startswith("spotify:"):
+            parts = value.split(":")
+            if len(parts) >= 3:
+                return parts[-1]
+        return value
