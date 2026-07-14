@@ -2406,6 +2406,7 @@ class MusiApp(App):
                 query, results, spotify_limit or 20))
             return
         self.query_one(SearchPane).watch_results(results, show_stats=show_stats)
+        self._focus_results_table()
 
     async def _spotify_search_with_top_result(self, query: str,
                                               tracks: list, limit: int) -> None:
@@ -2421,6 +2422,7 @@ class MusiApp(App):
         except Exception as e:
             log.warning("search_all mislukte: %s", e)
             self.query_one(SearchPane).watch_results(tracks)
+            self._focus_results_table()
             return
         # plak de top-result-rij aan de tracks-tabel vast. De top-rij is
         # een pseudo-Track met source=='spotify-top' zodat de rest van de
@@ -2435,6 +2437,7 @@ class MusiApp(App):
         except AttributeError:
             # SearchPane heeft de helper nog niet; toon alleen tracks.
             self.query_one(SearchPane).watch_results(tracks)
+        self._focus_results_table()
 
     async def _open_spotify_artist(self, query: str) -> None:
         """``/spotify-artiest <naam>`` — toont Top-artiest in de resultaten +
@@ -2469,6 +2472,7 @@ class MusiApp(App):
                 top_artist, track_objs)
         except AttributeError:
             self.query_one(SearchPane).watch_results(track_objs)
+        self._focus_results_table()
 
     async def _open_spotify_genre(self, query: str, limit: int) -> None:
         """``/spotify-genre <naam> [--limit=N]`` — toont Spotify's top-level
@@ -2499,6 +2503,7 @@ class MusiApp(App):
             return
         try:
             self.query_one(SearchPane).watch_genre_categories(query, cats)
+            self._focus_results_table()
         except AttributeError:
             self.notify("Genre-categorieën weergave niet geïmplementeerd.",
                         severity="warning")
@@ -2540,6 +2545,7 @@ class MusiApp(App):
             self.results = track_objs
             label = self.query_one("#search-source-label", Label)
             label.update(f"bron: spotify-artiest · {artist.get('name', '?')}")
+            self._focus_results_table()
         except Exception as e:
             self.notify(f"Render-fout: {e}", severity="error")
 
@@ -2568,6 +2574,7 @@ class MusiApp(App):
             return
         self.results = tracks
         self.query_one(SearchPane).watch_results(tracks)
+        self._focus_results_table()
         label = self.query_one("#search-source-label", Label)
         label.update(
             f"bron: spotify-album · {alb.get('name', '?')} · {len(tracks)} tracks")
@@ -2618,6 +2625,7 @@ class MusiApp(App):
                 header=f"{len(items)} {kind} voor '{cat.get('name', '?')}'")
             label = self.query_one("#search-source-label", Label)
             label.update(f"bron: spotify-genre · {cat.get('name', '?')} · {kind}")
+            self._focus_results_table()
         except Exception as e:
             self.notify(f"Render-fout: {e}", severity="error")
 
@@ -2665,6 +2673,7 @@ class MusiApp(App):
                 return
             self.results = tracks
             self.query_one(SearchPane).watch_results(tracks)
+            self._focus_results_table()
             label = self.query_one("#search-source-label", Label)
             label.update(
                 f"bron: spotify-playlist · {item.get('name', '?')} · {len(tracks)} tracks")
@@ -2679,6 +2688,33 @@ class MusiApp(App):
     # ---- actie-handlers (BINDINGS) -----------------------------------
     def action_focus_search(self) -> None:
         self.query_one("#search-input", Input).focus()
+
+    def _focus_results_table(self) -> None:
+        """Verplaats focus naar de #results-tabel en zet de cursor op de
+        eerste zinvolle rij (skip header-rijen zoals ``h:top`` /
+        ``h:cat`` / ``h:gd``). Wordt aangeroepen na elke ``watch_*``-render
+        zodat de volgende Enter meteen drill/speel-trigger werkt — anders
+        moet de gebruiker eerst handmatig Tab/↓ doen om focus bij de
+        tabel te krijgen.
+        """
+        try:
+            tbl = self.query_one("#results-table", DataTable)
+        except Exception:
+            return
+        if tbl.row_count == 0:
+            return
+        tbl.focus()
+        # zoek eerste rij zonder h:-prefix
+        target = 0
+        for i in range(tbl.row_count):
+            try:
+                k = tbl.coordinate_to_cell_key((i, 0)).row_key.value
+                if k and not k.startswith("h:"):
+                    target = i
+                    break
+            except Exception:
+                pass
+        tbl.move_cursor(row=target)
 
     async def action_toggle_pause(self) -> None:
         """Spatie: wissel pauze/hervat op de actieve engine (no-op als er niets
