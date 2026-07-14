@@ -18,6 +18,7 @@ De orchestrator is bewust engine-agnostic: hij praat alleen tegen de
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -74,6 +75,13 @@ class Orchestrator:
         self._event_cb = event_cb
         self.queue = Queue()
         self.state: EngineState = EngineState()
+        # Monotonisch oplopende teller die per nieuwe playback omhoog gaat.
+        # Geplande ``_on_track_end``-taken leggen de waarde vast bij scheduling
+        # en vergelijken 'm opnieuw bij het uitvoeren — als een ``play_index``
+        # of expliciete ``stop`` ertussen de teller heeft opgehoogd, baalt de
+        # stale taak (uit een oude generatie) en springt de queue niet
+        # onnodig verder.
+        self._playback_generation = 0
         # Koppel state-callback van elke engine aan onze event-stream
         for name, eng in self._engines.items():
             eng.set_state_callback(lambda s, n=name: self._on_engine_state(n, s))
@@ -91,20 +99,33 @@ class Orchestrator:
         self._emit(PlaybackEvent(kind="state", state=state))
 
     def _on_track_end(self) -> None:
-        """Natuurlijk einde (eof) → speel de volgende, of stop als de queue op
-        is. Let op: dit wordt door een engine *buiten* een await aangeroepen
-        (vanuit een callback), dus de eventuele ``stop()`` wordt via
-        ``create_task`` gepland."""
+        """Plan de overgang na een natuurlijk einde.
+
+        Engine-callbacks kunnen uit een oude playback-generatie komen. De
+        geplande taak controleert daarom opnieuw of de queue nog actief is
+        voordat hij een volgende track start.
+        """
+        generation = self._playback_generation
         log.info("track-einde → volgende")
-        if self.queue.has_next():
-            self.play_index(self.queue.index + 1)
-        else:
-            self.queue.index = self.queue.index  # einde van de queue
-            # expliciet stop op actieve engine zodat status schoon wordt
-            eng_name = self._active_engine_name()
-            if eng_name is not None:
-                import asyncio
-                asyncio.create_task(self._engines[eng_name].stop())
+
+        async def advance() -> None:
+            await asyncio.sleep(0)
+            if generation != self._playback_generation or not self.queue.tracks:
+                return
+            if self.queue.has_next():
+                await self.play_index(self.queue.index + 1)
+            else:
+                eng_name = self._active_engine_name()
+                if eng_name is not None:
+                    try:
+                        await self._engines[eng_name].stop()
+                    except Exception:
+                        log.debug("stop na track-einde mislukt", exc_info=True)
+
+        try:
+            asyncio.get_running_loop().create_task(advance())
+        except RuntimeError:
+            log.debug("track-einde zonder actieve event-loop genegeerd")
 
     # ---- engine-keuze -----------------------------------------------
     def _active_engine_name(self) -> str | None:
@@ -142,9 +163,15 @@ class Orchestrator:
 
         Buiten bereik → no-op. Bij een engine-fout emit we een error-event
         i.p.v. te crashen (zodat de UI 'm kan tonen en de app draaiende blijft).
+
+        De ``_playback_generation`` wordt hier opgehoogd zodat een eventueel
+        nog openstaande ``_on_track_end``-taak uit de **vorige** track ziet
+        dat hij niet meer aan de beurt is — anders zou een natuurlijk einde
+        vlak vóór een handmatige ``next()`` de queue dubbel doorschuiven.
         """
         if not (0 <= i < len(self.queue.tracks)):
             return
+        self._playback_generation += 1
         track = self.queue.tracks[i]
         self.queue.index = i
         await self._ensure_active(track)
@@ -191,7 +218,10 @@ class Orchestrator:
             await eng.resume()
 
     async def stop(self) -> None:
-        """Stop álles — alle engines uit."""
+        """Stop álles — alle engines uit. Hoogt ook de playback-generatie op
+        zodat een openstaande ``_on_track_end``-taak uit een vorige generatie
+        zichzelf annuleert (anders zou die alsnog de queue doorschuiven)."""
+        self._playback_generation += 1
         for eng in self._engines.values():
             try:
                 await eng.stop()
@@ -236,7 +266,12 @@ class Orchestrator:
         self._emit_queue_event()
 
     def queue_clear(self) -> None:
-        """Wis de hele queue."""
+        """Wis de hele queue. Hoogt de playback-generatie op zodat een nog
+        openstaande ``_on_track_end``-taak uit een vorige generatie zichzelf
+        annuleert (de check ``not self.queue.tracks`` vangt de meeste gevallen
+        maar een gelijktijdige nieuwe ``play_index`` zou anders nog kunnen
+        doorschieten)."""
+        self._playback_generation += 1
         self.queue.clear()
         self._emit_queue_event()
 

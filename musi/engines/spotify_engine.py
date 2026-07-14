@@ -113,6 +113,10 @@ class SpotifyEngine(Engine):
         self._stopped = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self._last_sig: tuple | None = None  # laatst ge-emitte state-signatuur (dedup)
+        # Een expliciete Stop() geeft ook PlaybackStatus=Stopped terug. Deze
+        # vlag voorkomt dat zo'n handmatige stop als natuurlijk track-einde
+        # de queue vooruit laat springen.
+        self._explicit_stop_pending = False
 
     # ---- bus-verbinding ----------------------------------------------
     def _discover_name(self) -> str | None:
@@ -178,7 +182,27 @@ class SpotifyEngine(Engine):
                     log.debug("spotifyd nog niet bereikbaar: %s", e)
             if self._proxy is not None:
                 try:
+                    previous = self._state
                     st = await asyncio.to_thread(self._read_state_sync)
+                    # Spotify heeft geen apart EOF-signaal via MPRIS. Een
+                    # Playing -> Stopped-overgang op dezelfde track is daarom
+                    # het natuurlijke einde, behalve wanneer Stop() dit zelf
+                    # heeft veroorzaakt. Een track zonder metadata/duration
+                    # levert geen betrouwbaar einde-signaal op.
+                    same_track = (
+                        previous.track is not None
+                        and st.track is not None
+                        and previous.track.uri == st.track.uri
+                    )
+                    reached_end = (
+                        same_track
+                        and previous.status is EngineStatus.PLAYING
+                        and st.status is EngineStatus.STOPPED
+                        and previous.duration > 0
+                        and previous.position >= max(0.0, previous.duration - 1.5)
+                    )
+                    explicit_stop = self._explicit_stop_pending
+                    self._explicit_stop_pending = False
                     # signatuur om te detecteren of er iets veranderd is (zonder
                     # elke positie-microbeweging te emitten)
                     sig = (
@@ -191,6 +215,8 @@ class SpotifyEngine(Engine):
                         self._last_sig = sig
                         self._state = st
                         self._emit_state(st)
+                    if reached_end and not explicit_stop:
+                        self._emit_track_end()
                 except Exception as e:
                     log.debug("spotifyd poll-fout (proxy weg?): %s", e)
                     self._proxy = None  # forceer herverbinden
@@ -268,7 +294,12 @@ class SpotifyEngine(Engine):
 
     async def stop(self) -> None:
         """Stop (via MPRIS ``Stop``)."""
-        await asyncio.to_thread(lambda: self._require().Stop())  # type: ignore[attr-defined]
+        self._explicit_stop_pending = True
+        try:
+            await asyncio.to_thread(lambda: self._require().Stop())  # type: ignore[attr-defined]
+        except Exception:
+            self._explicit_stop_pending = False
+            raise
 
     async def pause(self) -> None:
         """Pauzeer (via MPRIS ``Pause``)."""
