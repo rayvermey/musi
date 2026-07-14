@@ -161,9 +161,22 @@ class NowPlaying(Static):
         badge = _badge_for(self.track)
         dur = _fmt_duration(self.duration)
         pos = _fmt_duration(self.progress)
+        # Progress-bar onder de tekst — visueel duidelijk hoever de speler is.
+        # We gebruiken een blokjes-glyph (█/░) zodat het in elke terminal werkt
+        # (geen sixel/halfblock nodig). Width = 30 vakjes = redelijk detail.
+        bar_w = 30
+        if self.duration > 0:
+            filled = max(0, min(bar_w, round(self.progress / self.duration * bar_w)))
+            bar = "█" * filled + "░" * (bar_w - filled)
+        else:
+            bar = "░" * bar_w
         left = f"{badge} {title}" + (f"  —  {artist}" if artist else "")
         right = f"{pos} / {dur}   {self.status_text}"
-        return f"{left}    [{right}]"
+        # Twee regels: bovenste = metadata, onderste = progress-bar.
+        # We krijgen 3 rijen van CSS (height:3) — laat de bovenste 2 gevuld.
+        line1 = f"{left}    [{right}]"
+        line2 = f"{bar}"
+        return f"{line1}\n{line2}"
 
     def update_from_state(self, state) -> None:
         self.track = state.track
@@ -2127,7 +2140,7 @@ class MusiApp(App):
     CSS = """
     Screen { layout: vertical; }
     #main { height: 1fr; }
-    NowPlaying { dock: bottom; height: 1; padding: 0 1; background: $boost; }
+    NowPlaying { dock: bottom; height: 3; padding: 0 1; background: $boost; }
     SearchPane, QueuePane, LibraryPane { height: 1fr; }
     """
 
@@ -2174,6 +2187,9 @@ class MusiApp(App):
                 yield QueuePane(self)
             with TabPane("Library", id="tab-library"):
                 yield LibraryPane(None)  # zodra compose zonder app; via on_mount zetten
+        # NowPlaying eerst (dock:bottom vult van onderaf), Footer daarna — anders
+        # zou Textual beide widgets op dezelfde y=laatste-rij zetten en elkaar
+        # op één pixel overdekken.
         yield NowPlaying(self.cfg.cache_dir / "art", id="now-playing")
         yield Footer()
 
