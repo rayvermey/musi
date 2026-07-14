@@ -314,9 +314,13 @@ class SearchPane(Vertical):
 
     def watch_artist_top(self, artist: dict, top_tracks: list[Track]) -> None:
         """Render de top-tracks van een artiest (gevolg op /spotify-artiest).
-        Eerste rij is een drill-key voor de artiest-detail; rijen 1+ zijn
-        tracks. De artiest is ook beschikbaar als pseudo-row met key
-        ``a:<uri>`` zodat de gebruiker 'm in een later stadium kan drillen."""
+        Rij 0 is een informatieve header met artiest-info (geen drill — Enter
+        doet hier niets); rijen 1+ zijn de top-tracks (afspeelbaar + savable).
+
+        Voorheen was rij 0 een ``a:<uri>``-drill die dezelfde top-tracks
+        opnieuw renderde. Visueel leek dat dan alsof Enter niets deed —
+        daarom is de rij nu puur een header.
+        """
         tbl = self.query_one("#results-table", DataTable)
         if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
             self._setup_columns(False)
@@ -328,7 +332,7 @@ class SearchPane(Vertical):
         tbl.add_row(
             "🎤", name,
             f"{followers:,} volgers" + (f" · {', '.join(genres)}" if genres else ""),
-            "", "artiest (drill)", key=f"a:{artist.get('uri', '')}",
+            "", "Top 10 — Tab ↓", key="h:artist",
         )
         for i, t in enumerate(top_tracks):
             tbl.add_row(t.badge, t.title, t.artist,
