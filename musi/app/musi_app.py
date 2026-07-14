@@ -1905,7 +1905,7 @@ class MusiApp(App):
             with TabPane("Zoeken", id="tab-search"):
                 yield SearchPane(self)
             with TabPane("Queue", id="tab-queue"):
-                yield QueuePane()
+                yield QueuePane(self)
             with TabPane("Library", id="tab-library"):
                 yield LibraryPane(None)  # zodra compose zonder app; via on_mount zetten
         yield NowPlaying(self.cfg.cache_dir / "art", id="now-playing")
