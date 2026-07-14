@@ -314,12 +314,9 @@ class SearchPane(Vertical):
 
     def watch_artist_top(self, artist: dict, top_tracks: list[Track]) -> None:
         """Render de top-tracks van een artiest (gevolg op /spotify-artiest).
-        Rij 0 is een informatieve header met artiest-info (geen drill — Enter
-        doet hier niets); rijen 1+ zijn de top-tracks (afspeelbaar + savable).
-
-        Voorheen was rij 0 een ``a:<uri>``-drill die dezelfde top-tracks
-        opnieuw renderde. Visueel leek dat dan alsof Enter niets deed —
-        daarom is de rij nu puur een header.
+        Rij 0 is een **drillbare** artiest-info-rij (key ``a:<uri>``) —
+        Enter drillt naar de discografie (albums/singles/compilaties).
+        Rijen 1+ zijn de top-tracks (afspeelbaar + savable).
         """
         tbl = self.query_one("#results-table", DataTable)
         if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
@@ -332,11 +329,78 @@ class SearchPane(Vertical):
         tbl.add_row(
             "🎤", name,
             f"{followers:,} volgers" + (f" · {', '.join(genres)}" if genres else ""),
-            "", "Top 10 — Tab ↓", key="h:artist",
+            "", "artiest (Enter = discografie)",
+            key=f"a:{artist.get('uri', '')}",
         )
         for i, t in enumerate(top_tracks):
             tbl.add_row(t.badge, t.title, t.artist,
                         _fmt_duration(t.duration), t.source, key=f"t:{i}")
+
+    def watch_artist_detail(self, artist: dict,
+                             albums: list[dict]) -> None:
+        """Render de discografie van een artiest: header (informatief) +
+        albums/singles/compilaties/appears_on als drill-rijen ``al:<uri>``.
+
+        Rij 0 = header ``h:ad`` (Enter doet niets — informatief). Rijen 1+
+        zijn albums (jaar als derde kolom, type-badge in de eerste kolom).
+
+        Albums worden gegroepeerd op type met tussen-headers (``h:sg-albums``,
+        ``h:sg-singles``, etc.) zodat de gebruiker kan onderscheiden wat
+        hij/zij ziet. Sub-headers tellen mee in de rij-iterate maar skippen
+        in Enter-dispatch (zelfde ``h:``-prefix als de artiest-header).
+        """
+        tbl = self.query_one("#results-table", DataTable)
+        if list(self._COLS_PLAIN) != getattr(self, "_cols_now", None):
+            self._setup_columns(False)
+        else:
+            tbl.clear()
+        name = artist.get("name") or "?"
+        followers = artist.get("followers", {}).get("total") or 0
+        genres = (artist.get("genres") or [])[:3]
+        # header
+        tbl.add_row(
+            "🎤", name,
+            f"{followers:,} volgers" + (f" · {', '.join(genres)}" if genres else ""),
+            "", f"{len(albums)} releases — Tab ↓",
+            key="h:ad",
+        )
+        # groepeer albums per type
+        groups: dict[str, list[dict]] = {
+            "album": [], "single": [], "compilation": [], "appears_on": [],
+        }
+        for alb in albums:
+            t = (alb.get("album_type") or "album").lower()
+            groups.setdefault(t, []).append(alb)
+        group_labels = [
+            ("album", "💿 Albums"),
+            ("single", "🎵 Singles & EPs"),
+            ("compilation", "📀 Compilaties"),
+            ("appears_on", "👥 Appears on"),
+        ]
+        for key, label in group_labels:
+            items = groups.get(key, [])
+            if not items:
+                continue
+            # sub-header (skip in Enter-dispatch)
+            tbl.add_row(
+                "", f"   {label}  ({len(items)})", "", "",
+                "sectie-header",
+                key=f"h:sg-{key}",
+            )
+            # albums in deze groep
+            for alb in items:
+                alb_name = alb.get("name") or "?"
+                alb_artists = ", ".join(
+                    a["name"] for a in (alb.get("artists") or [])
+                    if a.get("name"))
+                if not alb_artists:
+                    alb_artists = name
+                yr = (alb.get("release_date") or "")[:4] or "—"
+                tbl.add_row(
+                    "💿", alb_name, alb_artists, yr,
+                    key or "album",
+                    key=f"al:{alb.get('uri', '')}",
+                )
 
     def watch_genre_categories(self, query: str,
                                categories: list[dict]) -> None:
@@ -2519,9 +2583,14 @@ class MusiApp(App):
     # we via ``self.notify`` zodat de gebruiker niet naar logs hoeft te kijken.
 
     async def _open_spotify_artist_by_uri(self, uri_or_id: str) -> None:
-        """Drill op een artiest-rij in de Search-resultaten: haalt de artiest
-        + top-tracks en rendert ze via ``watch_artist_top``. ``uri_or_id`` is
-        een ``spotify:artist:<id>`` URI of kale hex-ID."""
+        """Drill op een artiest-rij in de Search-resultaten: haalt de
+        discografie (albums + singles + compilaties + appears_on) en
+        rendert ze via ``watch_artist_detail``.
+
+        ``uri_or_id`` is een ``spotify:artist:<id>`` URI of kale hex-ID.
+        Vanuit deze view kan de gebruiker doordrillen op een album
+        (key ``al:<uri>``) om de track-lijst te laden.
+        """
         sp = self.services.providers.get("spotify")
         if sp is None:
             self.notify("Spotify niet beschikbaar.", severity="error")
@@ -2535,20 +2604,22 @@ class MusiApp(App):
             self.notify("Artiest niet gevonden.", severity="warning")
             return
         try:
-            top = await sp.artist_top_tracks(artist["id"])
+            albums = await sp.artist_albums(
+                artist.get("id") or uri_or_id,
+                limit=50,
+                groups="album,single,compilation,appears_on",
+            )
         except Exception as e:
-            self.notify(f"Top-tracks mislukt: {e}", severity="warning")
-            top = []
-        from ..search.spotify import _to_track
-        track_objs = [_to_track(t) for t in (top or []) if t]
+            self.notify(f"Discografie mislukt: {e}", severity="error")
+            return
         try:
-            self.query_one(SearchPane).watch_artist_top(artist, track_objs)
-            # sla de artiest op in app-state zodat ``_open_spotify_album_by_uri``
-            # weet welke artiest we aan het drillen zijn.
+            self.query_one(SearchPane).watch_artist_detail(artist, albums)
             self._current_drill_artist = artist
-            self.results = track_objs
+            self.results = []  # drill-view heeft geen track-results
             label = self.query_one("#search-source-label", Label)
-            label.update(f"bron: spotify-artiest · {artist.get('name', '?')}")
+            label.update(
+                f"bron: spotify-discografie · {artist.get('name', '?')} "
+                f"· {len(albums)} releases")
             self._focus_results_table()
         except Exception as e:
             self.notify(f"Render-fout: {e}", severity="error")

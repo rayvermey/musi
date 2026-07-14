@@ -127,8 +127,13 @@ afspeelbaar en savable (druk `s`).
 #### `/spotify-artiest <naam>`
 
 `/spotify-artiest Herman Brood` toont de **artiest** als eerste rij +
-diens **10 top-tracks** in de Spotify-markt US. Drill op de artiest-rij
-opent nogmaals de top-tracks (handig na een langere zoekslag).
+diens **10 top-tracks** in de Spotify-markt US. De artiest-rij is
+drillable — Enter drillt naar de **discografie**: alle albums, singles,
+compilaties en "appears-on" gegroepeerd (sub-headers per type). Per
+album-rij (key `al:<uri>`) drillt Enter naar de track-lijst.
+
+Werkt ook vanuit de Top-resultaat-kaart (`/spotify Herman Brood`): de
+🎤-artiest-rij drillt dezelfde discografie.
 
 #### `/spotify-genre <categorie> [--limit=N]`
 
