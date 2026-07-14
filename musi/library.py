@@ -146,11 +146,17 @@ class Library:
             self._conn.executescript(_SCHEMA)
             # Migratie: bestaande DB's (van voor de Genre-tab) hebben geen
             # ``genre``-kolom. ALTER TABLE is idempotent als we 'm conditioneel
-            # maken via PRAGMA. Eerste rescan vult 'm voor alle bestaande tracks.
+            # maken via PRAGMA. Daarnaast: incrementele scan slaat bestanden
+            # met ongewijzigde mtime over — dus bestaande tracks zouden hun
+            # genre nooit ingevuld krijgen. Forceer éénmalig een re-read door
+            # alle mtimes op 0 te zetten (volgende rescan ziet 0 ≠ file-mtime
+            # en herleest elk bestand). Alleen binnen deze migratie-branch —
+            # verse DB's en post-migratie-INSERTs blijven onaangeraakt.
             cols = {r["name"] for r in
                     self._conn.execute("PRAGMA table_info(tracks)").fetchall()}
             if "genre" not in cols:
                 self._conn.execute("ALTER TABLE tracks ADD COLUMN genre TEXT")
+                self._conn.execute("UPDATE tracks SET mtime = 0")
             self._conn.commit()
 
     def close(self) -> None:

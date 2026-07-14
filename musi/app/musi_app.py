@@ -57,6 +57,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
+    Button,
     DataTable,
     Footer,
     Header,
@@ -353,17 +354,22 @@ class LibraryPane(Vertical):
         width: 3fr;
         border: round $accent;
     }
-    /* Genre-tab: meta links (genres-lijst), detail-rechts met eigen
-       geneste TabbedContent (Tracks/Artiesten/Albums). Zelfde 1fr-patroon
-       als Albums/Artiesten + geneste-tabs om de scroll-bug te vermijden. */
-    #lib-genres { height: 1fr; }
-    #lib-genres-meta { width: 2fr; height: 1fr; }
-    #lib-genres-tabs, #gn-tracks, #gn-artists, #gn-albums { height: 1fr; }
-    #lib-genres-tracks, #lib-genres-artists, #lib-genres-albums {
-        height: 1fr;
-        border: round $accent;
+    /* Genre-tab: meta links (genres-lijst), detail rechts met zelfgemaakte
+       tab-knoppen + 1 DataTable. Geen Textual-TabbedContent hier — die
+       claimde in een Horizontal de hele parent-breedte en drukte de meta-
+       tabel weg. Harde breedte `32` op de meta-wrapper. */
+    LibraryPane #lib-genres { height: 1fr; }
+    LibraryPane #lib-genres-left { width: 32; height: 1fr; }
+    LibraryPane #lib-genres-meta { height: 1fr; }
+    LibraryPane #lib-genres-hint {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
     }
-    #lib-genres-hint {
+    LibraryPane #lib-genres-right { height: 1fr; }
+    LibraryPane #lib-genres-tabbar { height: 3; padding: 0 1; }
+    LibraryPane #lib-genres-detail { height: 1fr; border: round $accent; }
+    LibraryPane #lib-genres-detail-hint {
         height: 1;
         padding: 0 1;
         background: $boost;
@@ -442,17 +448,34 @@ class LibraryPane(Vertical):
         self._artist_tracks: list[Track] = []
         self._artists_loaded = False
         # ---- Genre (Lokaal > Genre) ----
-        # Een geselecteerd genre vult drie sub-tabs in één keer:
-        # tracks/artists/albums. Bij drill van artiest→tracks of album→tracks
-        # wordt de tracks-sub-tab opnieuw gevuld met `genre_artist_tracks`
-        # of `genre_album_tracks`. De sub-tab overleeft geen tab-wissel
-        # buiten het Genre-tabblad — _drill_genre draait opnieuw bij terugkeer.
+        # Eén geselecteerd genre + drie data-lijsten (tracks/artists/albums);
+        # de detail-zijde toont ALTIJD dezelfde `#lib-genres-detail`-DataTable,
+        # waarvan we de kolommen + rijen verversen op basis van
+        # ``self._genre_view`` (één van "tracks"/"artists"/"albums").
+        # Tab-wissel via Button-klik (#gn-btn-*) → ``_set_genre_view``.
+        # Bij drill van artiest→tracks of album→tracks wordt de tracks-view
+        # geforceerd + de detail-tabel opnieuw gevuld met de gefilterde data.
         self._genres: list[dict] = []                  # [{"genre","count"}]
         self._genre_name: str = ""                     # geselecteerde genre
+        self._genre_view: str = "tracks"               # actieve sub-view
         self._genre_tracks: list[Track] = []
         self._genre_artists: list[dict] = []
         self._genre_albums: list[dict] = []
         self._genres_loaded = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Genre-tab-knoppen: wissel tussen Tracks / Artiesten / Albums view
+        en refresh de detail-tabel. Alleen actief als de knop tot de
+        Genre-tabbar behoort (anders zou hij ook reageren op andere knoppen
+        elders in de app)."""
+        bid = event.button.id
+        if bid not in ("gn-btn-tracks", "gn-btn-artists", "gn-btn-albums"):
+            return
+        view = bid.removeprefix("gn-btn-")
+        if view == self._genre_view:
+            return  # al actief
+        self._set_genre_view(view)
+        self._render_genre_detail()
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         """Lazy-load per subtab: bij eerste openen data vullen + focus op de
@@ -498,11 +521,8 @@ class LibraryPane(Vertical):
                 # hier — pas bij Enter wordt de YouTubeSearch aangeroepen).
                 self._render_yt_meta()
             self.query_one("#lib-yt-meta", DataTable).focus()
-        # Geneste TabbedContent van de Genre-tab: sub-tab-wissel → focus de
-        # juiste child-DataTable. (Wordt ook gevuurd als de gebruiker een
-        # tab selecteert die we zelf hebben geactiveerd vanuit _drill_genre.)
-        elif pid in ("gn-tracks", "gn-artists", "gn-albums"):
-            self._focus_genres_sub_table(pid)
+        # Geen gn-* elif meer — de Genre-detail-view wordt gewisseld via
+        # Button-kliks (#gn-btn-*) i.p.v. via Textual's TabbedContent.
 
     def compose(self) -> ComposeResult:
         with TabbedContent(initial="lib-local"):
@@ -537,31 +557,34 @@ class LibraryPane(Vertical):
                             yield DataTable(id="lib-artists-detail",
                                             cursor_type="row")
                     with TabPane("Genre", id="ll-genres"):
-                        # Genres-lijst links + geneste TabbedContent rechts
-                        # met drie sub-tabs (Tracks / Artiesten / Albums).
-                        # De meta-tabel drillt niet rechtstreeks naar tracks;
-                        # _drill_genre vult alle drie de sub-tabs in één keer
-                        # met data van het geselecteerde genre.
+                        # Genres-lijst links + detail-rechts. De detail-zijde
+                        # is een **Vertical met zelfgemaakte tab-knoppen** +
+                        # **één DataTable** (waarvan we de inhoud refreshen
+                        # op knop-klik). Dit vermijdt Textual's
+                        # ``TabbedContent``-in-``Horizontal``-bug (claimt
+                        # de hele parent-breedte en drukt de meta-tabel weg).
                         with Horizontal(id="lib-genres"):
                             with Vertical(id="lib-genres-left"):
                                 yield DataTable(id="lib-genres-meta",
                                                 cursor_type="row")
                                 yield Label(
-                                    "(Genre-tab: kies een genre om tracks, "
-                                    "artiesten en albums te zien)",
+                                    "(kies een genre)",
                                     id="lib-genres-hint",
                                 )
-                            with TabbedContent(id="lib-genres-tabs",
-                                               initial="gn-tracks"):
-                                with TabPane("Tracks", id="gn-tracks"):
-                                    yield DataTable(id="lib-genres-tracks",
-                                                    cursor_type="row")
-                                with TabPane("Artiesten", id="gn-artists"):
-                                    yield DataTable(id="lib-genres-artists",
-                                                    cursor_type="row")
-                                with TabPane("Albums", id="gn-albums"):
-                                    yield DataTable(id="lib-genres-albums",
-                                                    cursor_type="row")
+                            with Vertical(id="lib-genres-right"):
+                                with Horizontal(id="lib-genres-tabbar"):
+                                    yield Button("Tracks", id="gn-btn-tracks",
+                                                 variant="primary")
+                                    yield Button("Artiesten",
+                                                 id="gn-btn-artists")
+                                    yield Button("Albums",
+                                                 id="gn-btn-albums")
+                                yield DataTable(id="lib-genres-detail",
+                                                cursor_type="row")
+                                yield Static(
+                                    "(kies een genre om te beginnen)",
+                                    id="lib-genres-detail-hint",
+                                )
             with TabPane("Spotify", id="lib-spotify"):
                 # albums/playlists links, track-lijst rechts — altijd beide
                 # zichtbaar, zodat drill-down niet in een weggedrukte tabel
@@ -592,12 +615,11 @@ class LibraryPane(Vertical):
         self.query_one("#lib-artists-meta", DataTable).add_columns("Artiest", "#")
         self.query_one("#lib-artists-detail", DataTable).add_columns("♪", "Titel", "Album", "Duur")
         self.query_one("#lib-genres-meta", DataTable).add_columns("Genre", "#")
-        self.query_one("#lib-genres-tracks", DataTable).add_columns(
-            "♪", "Titel", "Artiest", "Album", "Duur")
-        self.query_one("#lib-genres-artists", DataTable).add_columns(
-            "Artiest", "Albums", "Tracks")
-        self.query_one("#lib-genres-albums", DataTable).add_columns(
-            "Album", "Artiest", "#")
+        # Genre-detail is één DataTable waarvan we de kolommen switchen
+        # op basis van de actieve sub-view (tracks/artists/albums).
+        # Initiële kolommen zijn voor de Tracks-view; latere schakelaars
+        # via _render_genre_detail() herbouwen de kolommen.
+        self._ensure_genre_detail_columns("tracks")
         # Spotify
         self.query_one("#lib-spotify-meta", DataTable).add_columns("Naam", "Type", "Eigenaar")
         self.query_one("#lib-detail-table", DataTable).add_columns("♪", "Titel", "Artiest", "Album", "Duur")
@@ -705,24 +727,21 @@ class LibraryPane(Vertical):
                 await self._app.play_track(self._artist_tracks[idx])
             return
 
-        # Lokaal > Genre: 3 sub-tabs (Tracks / Artiesten / Albums) + meta.
-        gt = self.query_one("#lib-genres-tracks", DataTable)
+        # Lokaal > Genre: detail-tabel (één) + meta.
+        gt = self.query_one("#lib-genres-detail", DataTable)
         if gt.has_focus:
-            idx = self._row_index(gt, "gt:")
-            if idx is not None and idx < len(self._genre_tracks):
-                await self._app.play_track(self._genre_tracks[idx])
-            return
-        ga = self.query_one("#lib-genres-artists", DataTable)
-        if ga.has_focus:
-            idx = self._row_index(ga, "ga:")
-            if idx is not None and idx < len(self._genre_artists):
-                await self._drill_genre_artist(idx)
-            return
-        gl = self.query_one("#lib-genres-albums", DataTable)
-        if gl.has_focus:
-            idx = self._row_index(gl, "gl:")
-            if idx is not None and idx < len(self._genre_albums):
-                await self._drill_genre_album(idx)
+            if self._genre_view == "tracks":
+                idx = self._row_index(gt, "gt:")
+                if idx is not None and idx < len(self._genre_tracks):
+                    await self._app.play_track(self._genre_tracks[idx])
+            elif self._genre_view == "artists":
+                idx = self._row_index(gt, "ga:")
+                if idx is not None and idx < len(self._genre_artists):
+                    await self._drill_genre_artist(idx)
+            else:  # albums
+                idx = self._row_index(gt, "gl:")
+                if idx is not None and idx < len(self._genre_albums):
+                    await self._drill_genre_album(idx)
             return
 
         # Spotify track-lijst (drill of Liked songs).
@@ -876,36 +895,33 @@ class LibraryPane(Vertical):
                 self._app.orchestrator.queue_add(self._artist_tracks[idx])
             return
 
-        # Lokaal > Genre: tracks/artiesten/albums sub-tabs.
-        gt = self.query_one("#lib-genres-tracks", DataTable)
+        # Lokaal > Genre: detail-tabel (één) — dispatch per view.
+        gt = self.query_one("#lib-genres-detail", DataTable)
         if gt.has_focus:
-            idx = self._row_index(gt, "gt:")
-            if idx is not None and idx < len(self._genre_tracks):
-                self._app.orchestrator.queue_add(self._genre_tracks[idx])
-            return
-        ga = self.query_one("#lib-genres-artists", DataTable)
-        if ga.has_focus:
-            idx = self._row_index(ga, "ga:")
-            if idx is not None and idx < len(self._genre_artists):
-                artist = self._genre_artists[idx]["artist"]
-                tracks = await self._run(
-                    self._app.services.library.genre_artist_tracks,
-                    self._genre_name, artist)
-                self._app.orchestrator.queue_extend(tracks)
-                self._app.notify(
-                    f"+{len(tracks)} '{artist}' in '{self._genre_name}'")
-            return
-        gl = self.query_one("#lib-genres-albums", DataTable)
-        if gl.has_focus:
-            idx = self._row_index(gl, "gl:")
-            if idx is not None and idx < len(self._genre_albums):
-                album = self._genre_albums[idx]["album"]
-                tracks = await self._run(
-                    self._app.services.library.genre_album_tracks,
-                    self._genre_name, album)
-                self._app.orchestrator.queue_extend(tracks)
-                self._app.notify(
-                    f"+{len(tracks)} album '{album}' in '{self._genre_name}'")
+            if self._genre_view == "tracks":
+                idx = self._row_index(gt, "gt:")
+                if idx is not None and idx < len(self._genre_tracks):
+                    self._app.orchestrator.queue_add(self._genre_tracks[idx])
+            elif self._genre_view == "artists":
+                idx = self._row_index(gt, "ga:")
+                if idx is not None and idx < len(self._genre_artists):
+                    artist = self._genre_artists[idx]["artist"]
+                    tracks = await self._run(
+                        self._app.services.library.genre_artist_tracks,
+                        self._genre_name, artist)
+                    self._app.orchestrator.queue_extend(tracks)
+                    self._app.notify(
+                        f"+{len(tracks)} '{artist}' in '{self._genre_name}'")
+            else:  # albums
+                idx = self._row_index(gt, "gl:")
+                if idx is not None and idx < len(self._genre_albums):
+                    album = self._genre_albums[idx]["album"]
+                    tracks = await self._run(
+                        self._app.services.library.genre_album_tracks,
+                        self._genre_name, album)
+                    self._app.orchestrator.queue_extend(tracks)
+                    self._app.notify(
+                        f"+{len(tracks)} album '{album}' in '{self._genre_name}'")
             return
         # Lokaal > Genre-meta: voeg álle tracks van dat genre toe (queue_extend).
         gn_meta = self.query_one("#lib-genres-meta", DataTable)
@@ -1119,32 +1135,21 @@ class LibraryPane(Vertical):
                             _fmt_duration(t.duration), key=f"rt:{i}")
             return
         # Lokaal > Genre: her-drill van het huidige genre zodat alle drie de
-        # sub-tabs de geüpdatete genre-waarde weerspiegelen. _drill_genre
-        # doet drie queries + vult de tabellen + focus de Tracks-sub-tab.
+        # data-lijsten de geüpdatete genre-waarde weerspiegelen. _drill_genre
+        # doet drie queries + rendert de actieve view.
         gn_meta = self.query_one("#lib-genres-meta", DataTable)
-        gt = self.query_one("#lib-genres-tracks", DataTable)
-        ga = self.query_one("#lib-genres-artists", DataTable)
-        gl = self.query_one("#lib-genres-albums", DataTable)
-        if (gn_meta.has_focus or gt.has_focus or ga.has_focus or gl.has_focus) \
+        gn_detail = self.query_one("#lib-genres-detail", DataTable)
+        if (gn_meta.has_focus or gn_detail.has_focus) \
                 and self._genre_name and self._genres:
-            # Vind de idx van het huidige genre in de (mogelijk verouderde)
-            # self._genres-lijst — vergelijk op naam want idx kan verschoven zijn.
             for i, g in enumerate(self._genres):
                 if g["genre"] == self._genre_name:
                     await self._drill_genre(i)
                     return
-            # Genre bestaat niet meer (track was de laatste met die genre).
-            # Forceer een volledige her-init zodra de tab opnieuw geactiveerd
-            # wordt; clear hier de detail-tabellen zodat de gebruiker niet
-            # naar oude data blijft kijken.
+            # Genre bestaat niet meer — clear + invalideer zodat de
+            # Genre-tab bij volgende activatie opnieuw wordt ingeladen.
             self._genres_loaded = False
-            tt = self.query_one("#lib-genres-tracks", DataTable)
-            tt.clear()
-            at = self.query_one("#lib-genres-artists", DataTable)
-            at.clear()
-            al = self.query_one("#lib-genres-albums", DataTable)
-            al.clear()
             self._genre_name = ""
+            gn_detail.clear()
 
     # ---- Lokaal-subtabs helpers --------------------------------------
     async def _run(self, fn, *args, **kwargs):
@@ -1257,103 +1262,115 @@ class LibraryPane(Vertical):
                         "tracks/artiesten/albums van dat genre.")
 
     async def _drill_genre(self, idx: int) -> None:
-        """Vul de drie sub-tabs van #lib-genres-tabs met data van het
-        geselecteerde genre: tracks / artiesten / albums. Schakel na
-        afloop naar de Tracks-sub-tab en focus de bijbehorende DataTable."""
+        """Vul de drie data-lijsten met data van het geselecteerde genre:
+        tracks / artiesten / albums. De detail-tabel toont de actieve view
+        (initieel 'tracks'); de gebruiker switcht via de tab-knoppen."""
         lib = self._app.services.library
         self._genre_name = self._genres[idx]["genre"]
-        # Drie aparte SQL-calls — sequentieel in deze coroutine (zelfde lock,
-        # dus parallel zou niets schelen); ~3× een index-lookup op genre.
         tracks = await self._run(lib.genre_tracks, self._genre_name)
         artists = await self._run(lib.genre_artists, self._genre_name)
         albums = await self._run(lib.genre_albums, self._genre_name)
         self._genre_tracks = tracks
         self._genre_artists = artists
         self._genre_albums = albums
-        # Tracks-sub-tab vullen
-        tt = self.query_one("#lib-genres-tracks", DataTable)
-        tt.clear()
-        for i, t in enumerate(tracks):
-            tt.add_row(t.badge, t.title, t.artist, t.album,
-                       _fmt_duration(t.duration), key=f"gt:{i}")
-        # Artiesten-sub-tab vullen
-        at = self.query_one("#lib-genres-artists", DataTable)
-        at.clear()
-        for i, a in enumerate(artists):
-            at.add_row(a["artist"],
-                       f"{a['album_count']}",
-                       f"{a['track_count']}",
-                       key=f"ga:{i}")
-        # Albums-sub-tab vullen
-        al = self.query_one("#lib-genres-albums", DataTable)
-        al.clear()
-        for i, a in enumerate(albums):
-            al.add_row(a["album"], a["artist"], f"{a['count']}",
-                       key=f"gl:{i}")
-        # Schakel naar de Tracks-sub-tab en geef focus aan de tracks-DataTable.
-        # We updaten de actieve tab van #lib-genres-tabs en focussen daarna
-        # de juiste child-DataTable (zie _focus_genres_sub_table).
-        self._set_genres_active_tab("gn-tracks")
-        self._focus_genres_sub_table("gn-tracks")
+        # Standaard terug naar tracks-view bij verse drill.
+        self._set_genre_view("tracks")
+        self._render_genre_detail()
         self._app.notify(
             f"Genre '{self._genre_name}': {len(tracks)} tracks · "
             f"{len(artists)} artiesten · {len(albums)} albums"
         )
 
     async def _drill_genre_artist(self, idx: int) -> None:
-        """Drill vanuit de Artiesten-sub-tab terug naar de Tracks-sub-tab,
-        gevuld met enkel die artiest-zijn-genre-tracks. Schakelt actieve
-        sub-tab naar Tracks en geeft focus aan de tracks-DataTable."""
+        """Drill vanuit de Artiesten-view: laadt de genre-tracks van die
+        artiest, switcht naar tracks-view, vult de detail-tabel."""
         lib = self._app.services.library
         artist = self._genre_artists[idx]["artist"]
         tracks = await self._run(lib.genre_artist_tracks,
                                  self._genre_name, artist)
         self._genre_tracks = tracks
-        tt = self.query_one("#lib-genres-tracks", DataTable)
-        tt.clear()
-        for i, t in enumerate(tracks):
-            tt.add_row(t.badge, t.title, t.artist, t.album,
-                       _fmt_duration(t.duration), key=f"gt:{i}")
-        self._set_genres_active_tab("gn-tracks")
-        self._focus_genres_sub_table("gn-tracks")
+        self._set_genre_view("tracks")
+        self._render_genre_detail()
         self._app.notify(
             f"{artist} in '{self._genre_name}': {len(tracks)} tracks"
         )
 
     async def _drill_genre_album(self, idx: int) -> None:
-        """Drill vanuit de Albums-sub-tab terug naar de Tracks-sub-tab,
-        gevuld met enkel dat album-zijn-genre-tracks."""
+        """Drill vanuit de Albums-view: laadt de genre-tracks van dat album."""
         lib = self._app.services.library
         album = self._genre_albums[idx]["album"]
         tracks = await self._run(lib.genre_album_tracks,
                                  self._genre_name, album)
         self._genre_tracks = tracks
-        tt = self.query_one("#lib-genres-tracks", DataTable)
-        tt.clear()
-        for i, t in enumerate(tracks):
-            tt.add_row(t.badge, t.title, t.artist, t.album,
-                       _fmt_duration(t.duration), key=f"gt:{i}")
-        self._set_genres_active_tab("gn-tracks")
-        self._focus_genres_sub_table("gn-tracks")
+        self._set_genre_view("tracks")
+        self._render_genre_detail()
         self._app.notify(
             f"Album '{album}' in '{self._genre_name}': {len(tracks)} tracks"
         )
 
-    def _set_genres_active_tab(self, pane_id: str) -> None:
-        """Zet de actieve sub-tab van #lib-genres-tabs zonder animatie."""
-        tc = self.query_one("#lib-genres-tabs", TabbedContent)
-        tc.active = pane_id
+    def _set_genre_view(self, view: str) -> None:
+        """Switch de actieve sub-view en update de button-varianten.
 
-    def _focus_genres_sub_table(self, pane_id: str) -> None:
-        """Geef de DataTable binnen een Genre-sub-tab focus (anders blijft
-        focus op de oude tabel of op de TabbedContent-strip hangen, en dan
-        eet de TabbedContent-keys Enter op)."""
-        if pane_id == "gn-tracks":
-            self.query_one("#lib-genres-tracks", DataTable).focus()
-        elif pane_id == "gn-artists":
-            self.query_one("#lib-genres-artists", DataTable).focus()
-        elif pane_id == "gn-albums":
-            self.query_one("#lib-genres-albums", DataTable).focus()
+        De variant="primary" op de actieve button benadrukt 'm visueel;
+        de andere krijgen variant="default" (Button default)."""
+        self._genre_view = view
+        for v, btn_id in (("tracks", "gn-btn-tracks"),
+                          ("artists", "gn-btn-artists"),
+                          ("albums",  "gn-btn-albums")):
+            try:
+                btn = self.query_one(f"#{btn_id}", Button)
+                btn.variant = "primary" if v == view else "default"
+            except Exception:
+                pass  # button niet gevonden — niet kritiek
+
+    def _ensure_genre_detail_columns(self, view: str) -> None:
+        """Stel de juiste kolommen in voor de detail-tabel op basis van de
+        view. Textual's DataTable laat niet toe om kolommen te wissen, dus
+        we clearen en add_columns opnieuw — add_columns is idempotent als
+        de namen matchen, anders voegt-ie dupes toe. Om dat te vermijden
+        skippen we als de huidige kolommen al kloppen."""
+        try:
+            dt = self.query_one("#lib-genres-detail", DataTable)
+        except Exception:
+            return  # compose nog niet klaar
+        if view == "tracks":
+            cols = ("♪", "Titel", "Artiest", "Album", "Duur")
+        elif view == "artists":
+            cols = ("Artiest", "Albums", "Tracks")
+        else:  # albums
+            cols = ("Album", "Artiest", "#")
+        # dt.columns is dict[ColumnKey, Column]; Column.label is Text.
+        existing = [str(c.label) for c in dt.columns.values()]
+        if list(existing) == list(cols):
+            return  # al goed — voorkomt duplicate-column-errors bij re-render
+        dt.clear(columns=True)
+        dt.add_columns(*cols)
+
+    def _render_genre_detail(self) -> None:
+        """Vul #lib-genres-detail met de rijen van de actieve view."""
+        self._ensure_genre_detail_columns(self._genre_view)
+        dt = self.query_one("#lib-genres-detail", DataTable)
+        dt.clear()
+        hint = self.query_one("#lib-genres-detail-hint", Static)
+        if self._genre_view == "tracks":
+            for i, t in enumerate(self._genre_tracks):
+                dt.add_row(t.badge, t.title, t.artist, t.album,
+                           _fmt_duration(t.duration), key=f"gt:{i}")
+            hint.update(f"{len(self._genre_tracks)} tracks in '{self._genre_name}'")
+        elif self._genre_view == "artists":
+            for i, a in enumerate(self._genre_artists):
+                dt.add_row(a["artist"], f"{a['album_count']}",
+                           f"{a['track_count']}", key=f"ga:{i}")
+            hint.update(f"{len(self._genre_artists)} artiesten — "
+                        f"Enter drillt naar hun genre-tracks")
+        else:  # albums
+            for i, a in enumerate(self._genre_albums):
+                dt.add_row(a["album"], a["artist"], f"{a['count']}",
+                           key=f"gl:{i}")
+            hint.update(f"{len(self._genre_albums)} albums — "
+                        f"Enter drillt naar hun genre-tracks")
+        dt.focus()
+        dt.move_cursor(row=0)
 
     # ---- key bindings (BINDINGS) ------------------------------------
     def action_go_up(self) -> None:
@@ -1401,7 +1418,7 @@ class LibraryPane(Vertical):
             await orch.play_all(self._artist_tracks)
             self._app.notify(f"▶ {len(self._artist_tracks)} artiest-tracks")
             return
-        # Lokaal > Genre: meta = heel genre; sub-tabs = sub-selectie.
+        # Lokaal > Genre: meta = heel genre; detail = huidige view.
         gn_meta = self.query_one("#lib-genres-meta", DataTable)
         if gn_meta.has_focus:
             idx = self._row_index(gn_meta, "gn:")
@@ -1411,32 +1428,30 @@ class LibraryPane(Vertical):
                 await orch.play_all(tracks)
                 self._app.notify(f"▶ genre '{genre}' ({len(tracks)})")
             return
-        gt = self.query_one("#lib-genres-tracks", DataTable)
-        if gt.has_focus and self._genre_tracks:
-            await orch.play_all(self._genre_tracks)
-            self._app.notify(f"▶ {len(self._genre_tracks)} tracks in '{self._genre_name}'")
-            return
-        ga = self.query_one("#lib-genres-artists", DataTable)
-        if ga.has_focus:
-            idx = self._row_index(ga, "ga:")
-            if idx is not None and idx < len(self._genre_artists):
-                artist = self._genre_artists[idx]["artist"]
-                tracks = await self._run(lib.genre_artist_tracks,
-                                         self._genre_name, artist)
-                await orch.play_all(tracks)
+        gt = self.query_one("#lib-genres-detail", DataTable)
+        if gt.has_focus:
+            if self._genre_view == "tracks" and self._genre_tracks:
+                await orch.play_all(self._genre_tracks)
                 self._app.notify(
-                    f"▶ {artist} in '{self._genre_name}' ({len(tracks)})")
-            return
-        gl = self.query_one("#lib-genres-albums", DataTable)
-        if gl.has_focus:
-            idx = self._row_index(gl, "gl:")
-            if idx is not None and idx < len(self._genre_albums):
-                album = self._genre_albums[idx]["album"]
-                tracks = await self._run(lib.genre_album_tracks,
-                                         self._genre_name, album)
-                await orch.play_all(tracks)
-                self._app.notify(
-                    f"▶ album '{album}' in '{self._genre_name}' ({len(tracks)})")
+                    f"▶ {len(self._genre_tracks)} tracks in '{self._genre_name}'")
+            elif self._genre_view == "artists":
+                idx = self._row_index(gt, "ga:")
+                if idx is not None and idx < len(self._genre_artists):
+                    artist = self._genre_artists[idx]["artist"]
+                    tracks = await self._run(lib.genre_artist_tracks,
+                                             self._genre_name, artist)
+                    await orch.play_all(tracks)
+                    self._app.notify(
+                        f"▶ {artist} in '{self._genre_name}' ({len(tracks)})")
+            elif self._genre_view == "albums":
+                idx = self._row_index(gt, "gl:")
+                if idx is not None and idx < len(self._genre_albums):
+                    album = self._genre_albums[idx]["album"]
+                    tracks = await self._run(lib.genre_album_tracks,
+                                             self._genre_name, album)
+                    await orch.play_all(tracks)
+                    self._app.notify(
+                        f"▶ album '{album}' in '{self._genre_name}' ({len(tracks)})")
 
     def _selected_detail_index(self) -> int | None:
         return self._row_index(self.query_one("#lib-detail-table", DataTable), "s:")
