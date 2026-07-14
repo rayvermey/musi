@@ -301,7 +301,7 @@ class SearchPane(Vertical):
                 severity="warning",
             )
             return
-        await self._app.open_save_picker([track.uri], track.title)
+        self._app.open_save_picker([track.uri], track.title)
 
     def _selected_index(self) -> int | None:
         tbl = self.query_one("#results-table", DataTable)
@@ -371,7 +371,7 @@ class QueuePane(Vertical):
                 severity="warning",
             )
             return
-        await self._app.open_save_picker([track.uri], track.title)
+        self._app.open_save_picker([track.uri], track.title)
 
 
 class LibraryPane(Vertical):
@@ -1027,7 +1027,7 @@ class LibraryPane(Vertical):
                 severity="warning",
             )
             return
-        await self._app.open_save_picker([track.uri], track.title)
+        self._app.open_save_picker([track.uri], track.title)
 
     def _focused_saveable_track(self) -> Track | None:
         """Geef de Track van de gefocuste track-rij in de LibraryPane, of

@@ -23,6 +23,7 @@ vandaar Buttons i.p.v. key-bindings voor opslaan in de edit-modal.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 from textual.app import ComposeResult
@@ -235,7 +236,7 @@ class PlaylistPickerModal(ModalScreen[PlaylistPick]):
             "✓", "Naam", "Tracks")
         self.query_one("#pl-pick-filter", Input).focus()
         # haal playlists + Liked Songs-count op de achtergrond
-        self.run_worker(self._load_lists(), exclusive=True)
+        asyncio.create_task(self._load_lists())
 
     async def _load_lists(self) -> None:
         sp = self._sp
@@ -243,7 +244,6 @@ class PlaylistPickerModal(ModalScreen[PlaylistPick]):
             self._render_table()
             return
         # beide ophalen in parallel — onafhankelijk van elkaar
-        import asyncio
         playlists, liked = await asyncio.gather(
             sp.user_playlists(limit=200),
             sp.saved_track_count(),
