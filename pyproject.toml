@@ -1,0 +1,20 @@
+[project]
+name = "musi"
+version = "0.1.0"
+description = "Alles-in-één muziek-TUI: lokaal + YouTube + Spotify (Niri/Wayland)"
+requires-python = ">=3.12"
+dependencies = [
+    "textual",
+    "textual-image",
+    "spotipy",
+    "dasbus",
+    "mutagen",
+    "yt-dlp",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["musi*"]

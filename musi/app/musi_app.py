@@ -1,0 +1,1537 @@
+"""Textual-TUI voor musi — drie tabs (Zoeken / Queue / Library) + now-playing footer.
+
+Architectuur in één zin: ``MusiApp`` koppelt één ``Orchestrator`` + ``Services``,
+vertaalt binnenkomende ``PlaybackEvent``s naar UI-updates (progressie in de
+now-playing-bar, queue-view), en stuurt zoek/play-acties terug naar de
+orchestrator.
+
+Layout::
+
+    ┌─ Header ─────────────────────────────────────────┐
+    │ TabbedContent#tabs                               │
+    │   • Zoeken  (SearchPane: Input + resultaten)     │
+    │   • Queue    (QueuePane: queue-tabel)            │
+    │   • Library  (LibraryPane: Lokaal/YouTube/Spotify)│
+    ├─ NowPlaying (gedockt onderaan: hoes + titel + voortgang) ┤
+    └─ Footer (toont de actieve keybindings)           ┘
+
+Belangrijke widgets:
+* **SearchPane** — zoek-Input + resultaten-DataTable. Bron-prefix (``/yt``,
+  ``/lokaal``, ``/spotify``) bepaalt welke providers zoeken; anders alle parallel.
+* **QueuePane** — toont de orchestrator-queue met de huidige track gemarkeerd.
+* **LibraryPane** — bladeren per bron:
+  * **Lokaal** (geneste subtabs): Nummers / Mappen / Albums / Artiesten;
+  * **YouTube**: Subscriptions / Favorieten / Watch Later / History (meta+detail);
+  * **Spotify**: albums/playlists links, tracks rechts (meta+detail).
+* **NowPlaying** — albumhoes (sixel/halfblock via textual-image) + titel/artiest
+  + positie/duur + bron-badge.
+
+Keybindings (zie ook de Footer):
+  * app-niveau: ``1/2/3`` tabs, ``/`` focus-zoek, ``spatie`` pauze, ``n/p``
+    volgende/vorige, ``+/-`` volume, ``c`` queue wissen, ``v`` video-aan/uit,
+    ``q`` quit;
+  * pane-niveau (Library): ``enter`` spelen/drillen, ``a`` toevoegen, ``A``
+    alles-spelen, ``u`` map omhoog.
+
+Textual-gotchas waar deze app tegenaan loopt (uitgebreider in memory
+``textual-event-and-tabs``): geen ``on_event`` override; ``Input.Submitted``
+bubbelt niet ver, dus handmatig afvangen; geneste ``TabbedContent``s leveren
+één ``TabActivated``-stroom (filter op ``pane.id``); en elke ``DataTable`` die
+direct in een Vertical/TabPane staat **moet** ``height:1fr`` hebben of 'm
+virtualiseert/scrollt niet (de "scrollt maar toont geen volgende rijen"-bug).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import subprocess  # voor DEVNULL bij video-mpv-spawn
+import urllib.error
+import urllib.request
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ProgressBar,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+
+from ..models import Track
+from ..orchestrator import Orchestrator, PlaybackEvent
+from ..rip import Ripper, video_id
+from ..services import Services
+from .. import art as art_mod
+from ..modals import ConfirmModal, EditTagsModal
+
+
+def _fmt_duration(s: float) -> str:
+    """Seconden → ``"m:ss"`` (of ``"—:—"`` bij ≤0/onbekend). Voor tabel-cellen en
+    de now-playing-bar."""
+    if s <= 0:
+        return "—:—"
+    m, sec = divmod(int(s), 60)
+    return f"{m}:{sec:02d}"
+
+
+def _fmt_upload_date(ud: str | None) -> str:
+    """``"YYYYMMDD"`` → ``"YYYY-MM-DD"`` (YouTube-stijl kort), of ``"—"``.
+
+    Accepteert enkel geldige 8-cijferige strings anders ``"—"`` — voorkomt
+    dat halfgevulde data een crash veroorzaakt in de tabel-cel."""
+    if not ud or len(ud) != 8 or not ud.isdigit():
+        return "—"
+    return f"{ud[:4]}-{ud[4:6]}-{ud[6:8]}"
+
+
+def _fmt_count(n: int | None) -> str:
+    """YouTube-stijl afkapping voor views/likes: ``"1.2M"`` / ``"12K"`` /
+    ``"123"`` / ``"—"`` (bij ``None`` of 0). Eén decimaal bij M en bij kleine
+    K-waarden (1.0K–9.9K), geen decimaal bij ≥10K. ``int()`` kapt af in plaats
+    van af te ronden, zodat 999 999 → ``"999K"`` (niet ``"1000K"``)."""
+    if n is None or n <= 0:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{int(n / 1_000)}K"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _badge_for(track: Track | None) -> str:
+    """Bron-badge van een track, of een puntje als 'm None is."""
+    return track.badge if track else "·"
+
+
+def _art_from_collection(coll: dict) -> str:
+    """Eerste beschikbare image-URL uit een Spotify album/playlist-dict (voor
+    albumhoes-doorplay aan album_tracks). Leeg als 'm er geen heeft."""
+    for im in (coll.get("images") or []):
+        if im.get("url"):
+            return im["url"]
+    return ""
+
+
+class NowPlaying(Static):
+    """Footer-balk met albumhoes (sixel/halfblock via textual-image) + titel/
+    artiest + positie/duur + bron-badge.
+
+    Update-reactives (``progress``/``duration``/``status_text``) houden de
+    weergave live sync zonder handmatig refreshen. Bij een nieuwe track
+    (gedetecteerd via uri-wissel) cache-bust'en we de hoes en proberen we een
+    nieuwe op te halen (``art.fetch``). De hoes wordt pas getoond als 'm er één
+    is; anders valt de balk terug op tekst.
+    """
+
+    progress: reactive[float] = reactive(0.0)
+    duration: reactive[float] = reactive(0.0)
+    status_text: reactive[str] = reactive("gestopt")
+    track: Track | None = None
+
+    def __init__(self, art_dir, **kw):
+        super().__init__(**kw)
+        self._art_dir = art_dir
+        self._last_track_id = None
+        self._art_path = None
+
+    def render(self):
+        # Probeer textual_image-SixelRenderable wanneer de terminal sixel ondersteunt.
+        if self._art_path is not None:
+            try:
+                from textual_image.renderable import Image as TexRenderable  # type: ignore
+                return TexRenderable(self._art_path)
+            except Exception:
+                pass
+        title = self.track.title if self.track else "—"
+        artist = self.track.artist if self.track and self.track.artist else ""
+        badge = _badge_for(self.track)
+        dur = _fmt_duration(self.duration)
+        pos = _fmt_duration(self.progress)
+        left = f"{badge} {title}" + (f"  —  {artist}" if artist else "")
+        right = f"{pos} / {dur}   {self.status_text}"
+        return f"{left}    [{right}]"
+
+    def update_from_state(self, state) -> None:
+        self.track = state.track
+        self.progress = state.position
+        self.duration = state.duration
+        self.status_text = {
+            "playing": "▶ afspelen",
+            "paused": "❙❙ pauze",
+            "stopped": "□ gestopt",
+        }.get(state.status.value, state.status.value)
+        # nieuwe track? cache-bust: probeer een nieuwe albumhoes
+        tid = (state.track.uri if state.track else None)
+        if tid != self._last_track_id:
+            self._last_track_id = tid
+            self._art_path = None
+            if state.track is not None:
+                try:
+                    from ..art import fetch
+                    self._art_path = fetch(state.track, self._art_dir)
+                except Exception:
+                    self._art_path = None
+
+
+class SearchPane(Vertical):
+    """Zoektab: een Input + een resultaten-DataTable (+ bron-label).
+
+    De Input accepteert een optionele **bron-prefix** om per-bron te zoeken:
+    ``/yt``/``/youtube`` (YouTube), ``/lokaal``/``/local``/``/l`` (lokaal),
+    ``/spotify``/``/sp`` (Spotify). Zonder prefix zoeken alle providers parallel.
+
+    ``enter`` is een priority-binding zodat 'm vóór de DataTable's eigen
+    Enter-binding komt — zie ``action_play_now`` voor de focus-afhankelijke
+    dispatch (Input gefocust → zoek; tabel gefocust → speel geselecteerde track).
+    """
+
+    BINDINGS = [
+        # priority=True: wordt gecheckt vóór de DataTable's eigen Enter-binding
+        # ("Select cells under the cursor"). Zonder priority eet de DataTable
+        # Enter op en komt play_now nooit aan.
+        Binding("enter", "play_now", "Speel/Open", priority=True),
+        Binding("a", "add_to_queue", "Toevoegen", priority=False),
+    ]
+
+    def __init__(self, app: "MusiApp") -> None:
+        super().__init__()
+        self._app = app
+
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder="Zoek…  (/bron: /lokaal /yt /spotify · /date = YouTube nieuwste eerst + kolommen datum/views/likes)",
+                    id="search-input")
+        with Horizontal():
+            yield Label("bron: alle", id="search-source-label")
+        yield DataTable(id="results-table", cursor_type="row")
+
+    # Kolom-sets voor de resultaten-tabel. Met ``stats`` toont de ``!date``-modus
+    # de YouTube-statistieken (datum, views, likes); zonder blijft de tabel op
+    # 5 kolommen. We herbouwen kolommen alleen als de set verandert om de
+    # cursor-rij en sort-state niet te storen bij gelijke set.
+    _COLS_PLAIN = ("♪", "Titel", "Artiest", "Duur", "Bron")
+    _COLS_STATS = ("♪", "Titel", "Artiest", "Duur", "Bron", "Datum", "Views", "Likes")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#results-table", DataTable)
+        self._setup_columns(show_stats=False)
+        self._cols_now = list(self._COLS_PLAIN)
+
+    def _setup_columns(self, show_stats: bool) -> None:
+        tbl = self.query_one("#results-table", DataTable)
+        cols = self._COLS_STATS if show_stats else self._COLS_PLAIN
+        tbl.clear(columns=True)
+        tbl.add_columns(*cols)
+        self._cols_now = list(cols)
+
+    def watch_results(self, results: list[Track], show_stats: bool = False) -> None:
+        """Render resultaten in de tabel. Bij ``show_stats=True`` (vanuit
+        ``!date``-modus) krijgt de tabel 3 extra kolommen Datum/Views/Likes;
+        anders blijft 't op 5. Tracks zonder YouTube-stats tonen ``"—"`` —
+        blijft uniform."""
+        tbl = self.query_one("#results-table", DataTable)
+        cols = self._COLS_STATS if show_stats else self._COLS_PLAIN
+        # Alleen kolommen herbouwen als de set verandert; anders alleen rijen
+        # clear'en (zo blijft de cursor-positie bij 'n re-render binnen dezelfde
+        # zoekopdracht behouden).
+        if list(cols) != getattr(self, "_cols_now", None):
+            self._setup_columns(show_stats)
+        else:
+            tbl.clear()
+        for i, t in enumerate(results):
+            if show_stats:
+                tbl.add_row(t.badge, t.title, t.artist, _fmt_duration(t.duration),
+                            t.source, _fmt_upload_date(t.upload_date),
+                            _fmt_count(t.view_count), _fmt_count(t.like_count),
+                            key=str(i))
+            else:
+                tbl.add_row(t.badge, t.title, t.artist, _fmt_duration(t.duration),
+                            t.source, key=str(i))
+
+    async def action_play_now(self) -> None:
+        # priority=True op deze Enter-binding onderschept Enter óók als de
+        # zoek-Input focus heeft — Input.Submitted wordt daarmee geblokkeerd
+        # (priority-binding wordt vóór de focused widget's bindings gecheckt).
+        # Fix: als de Input focus heeft, doe de zoekactie direct (en sla de
+        # Input.Submitted-bubbling over, die in deze Textual-versie niet
+        # betrouwbaar bij de parent aankomt).
+        si = self.query_one("#search-input", Input)
+        if si.has_focus:
+            await self._app._on_search_submit(si.value)
+            return
+        i = self._selected_index()
+        if i is None:
+            return
+        results: list[Track] = self._app.results
+        await self._app.play_track(results[i])
+
+    async def action_add_to_queue(self) -> None:
+        i = self._selected_index()
+        if i is None:
+            return
+        self._app.orchestrator.queue_add(self._app.results[i])
+
+    def _selected_index(self) -> int | None:
+        tbl = self.query_one("#results-table", DataTable)
+        if tbl.row_count == 0:
+            return None
+        try:
+            return int(tbl.coordinate_to_cell_key(tbl.cursor_coordinate).row_key.value)
+        except Exception:
+            return None
+
+
+class QueuePane(Vertical):
+    """Queue-tab: één DataTable met de orchestrator-queue. De actieve track
+    krijgt een ``▶``-markering. ``render_queue`` wordt aangeroepen vanuit de App
+    bij elk queue-event."""
+
+    def compose(self) -> ComposeResult:
+        yield DataTable(id="queue-table", cursor_type="row")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#queue-table", DataTable)
+        tbl.add_columns("♪", "Titel", "Artiest", "Duur")
+
+    def render_queue(self, queue) -> None:
+        tbl = self.query_one("#queue-table", DataTable)
+        tbl.clear()
+        for i, t in enumerate(queue.tracks):
+            mark = "▶" if i == queue.index else " "
+            tbl.add_row(f"{mark} {t.badge}", t.title, t.artist,
+                        _fmt_duration(t.duration), key=str(i))
+
+
+class LibraryPane(Vertical):
+    """Library-tabbladen: Lokaal (met subtabs Nummers/Mappen/Albums/Artiesten),
+    YouTube (Subscriptions/Favorieten/Watch Later/History) en Spotify
+    (Liked Songs + albums/playlists-drill-down).
+
+    Drill-down-patroon: meta-tabel links (categorieën zoals mappen of albums)
+    + detail-tabel rechts (tracks van de geselecteerde categorie). Bij focus
+    op de detail-tabel speelt ``enter`` de track; bij focus op de meta-tabel
+    drillt 'm naar de detail-tabel (en geeft 'm focus).
+
+    **Lazy loading**: elk tabblad (en de Lokaal-subtabs) wordt pas gevuld bij
+    de eerste activatie, via ``on_tabbed_content_tab_activated`` (gefilterd op
+    ``event.pane.id``). Dit voorkomt onnodige yt-dlp- / API-calls bij opstart
+    (Spotify-tabblad zou bv. anders OAuth triggeren bij elke start).
+
+    **Bindings** (op pane-niveau; werken als de pane of een kind focus heeft):
+      * ``enter`` (priority) → ``action_play_now``: context-dispatch op focus.
+      * ``a`` → ``action_add_to_queue``: leaf-track appenden, meta-rij =
+        heel album/artiest/map toevoegen (queue_extend).
+      * ``A`` → ``action_play_all_context``: vervang queue + speel alles van
+        huidige map / album / artiest / geladen detail-tracks.
+      * ``u`` → ``action_go_up``: één niveau omhoog in de Mappen-tab.
+    """
+
+    DEFAULT_CSS = """
+    /* Begrens elke DataTable die direct in een Vertical/TabPane staat, anders
+       neemt hij auto-hoogte = alle rijen en virtualiseert/scrollt niet. */
+    #lib-local-table { height: 1fr; }
+    #lib-local-tabs { height: 1fr; }
+    #lib-local { height: 1fr; }
+    #lib-folders-wrap { height: 1fr; }
+    #lib-folders-path { height: 1; padding: 0 1; background: $boost; }
+    #lib-folders-table { height: 1fr; }
+    #lib-albums, #lib-artists { height: 1fr; }
+    #lib-albums-meta, #lib-artists-meta { width: 2fr; height: 1fr; }
+    #lib-albums-detail, #lib-artists-detail {
+        width: 3fr;
+        border: round $accent;
+    }
+    LibraryPane #lib-spotify-split { height: 1fr; }
+    LibraryPane #lib-spotify-left { width: 2fr; }
+    LibraryPane #lib-spotify-meta { height: 1fr; }
+    LibraryPane #lib-detail-table {
+        width: 3fr;
+        border: round $accent;
+    }
+    /* YouTube library-tab — meta links, detail rechts; zelfde patroon als Spotify */
+    LibraryPane #lib-yt-split { height: 1fr; }
+    LibraryPane #lib-yt-left { width: 2fr; }
+    LibraryPane #lib-yt-meta { height: 1fr; }
+    LibraryPane #lib-yt-detail {
+        width: 3fr;
+        border: round $accent;
+    }
+    LibraryPane #lib-yt-hint {
+        height: 1; padding: 0 1; background: $boost;
+    }
+    """
+
+    # NOTE: `#lib-local-table { height: 1fr }` hierboven is niet optioneel.
+    # Zonder een begrensde hoogte neemt de DataTable auto-hoogte aan = alle
+    # rijen (hier tot 500), groeit dus 500 regels ver buiten z'n viewport, en
+    # virtualiseert/scrollt niet (scroll_y blijft 0 — de cursor schiet naar de
+    # laatste rij maar het scherm toont steeds dezelfde bovenste regels; de 1fr
+    # parent clip't de overflow weg). Met 1fr vult de tabel z'n TabPane en
+    # scrollt hij intern. #lib-detail-table heeft dit niet nodig: die staat in
+    # een Horizontal met height:1fr, die z'n children verticaal uitrekt.
+
+    BINDINGS = [
+        # priority=True: wordt gecheckt vóór de DataTable's eigen Enter-binding
+        # ("Select cells under the cursor"). Zonder priority eet de DataTable
+        # Enter op en komt play_now nooit aan.
+        Binding("enter", "play_now", "Speel/Open", priority=True),
+        Binding("a", "add_to_queue", "Toevoegen", priority=False),
+        Binding("A", "play_all_context", "Alles spelen"),
+        Binding("u", "go_up", "Map omhoog"),
+        # Tag-editor & delete-remove. `e` is alleen zinvol op een echte
+        # track-rij (niet op meta-rijen als album/artiest); de actie zelf
+        # checkt focus en dispatcht. `d` verwijdert: lokaal = bestand wissen.
+        # YT-playlists worden via youtube.com verwijderd (zie action_delete).
+        Binding("e", "edit_tags", "Tags wijzigen"),
+        Binding("d", "delete_or_remove", "Verwijderen"),
+    ]
+
+    def __init__(self, app: "MusiApp") -> None:
+        super().__init__()
+        self._app = app
+        # huidige rij-keuzes per tabel (cursor → Track of uri)
+        self._tracks: list = []   # Spotify- of YouTube-drill-track-lijst
+        self._local_tracks: list = []  # Library > Lokaal > Nummers-tab
+        self._spotify_loaded = False
+        # cache: opgeslagen albums + playlists, voor drill-down (hoes-URL lookup)
+        self._albums_by_uri: dict[str, dict] = {}
+        self._playlists_by_uri: dict[str, dict] = {}
+        # ---- Library > YouTube-tab ----
+        self._yt_loaded = False
+        # type-prefix in #lib-yt-meta (sub: / fav: / wl: / h:) → naam + benodigde
+        # methode op YouTubeSearch (zie _open_yt_collection).
+        self._yt_meta_rows: list[dict] = []
+        # ---- Lokaal-subtabs (Mappen / Albums / Artiesten) ----
+        # Mappen: huidige map als tuple componenten onder music_dir (() = root);
+        # entries = rijen in de folder-tabel: ("dir", naam) of ("track", Track).
+        self._folder_rel: tuple[str, ...] = ()
+        self._folder_entries: list[tuple[str, object]] = []
+        self._folder_loaded = False
+        # Albums / Artiesten: meta-lijsten + geladen detail-tracks
+        self._albums: list[dict] = []
+        self._album_tracks: list[Track] = []
+        self._albums_loaded = False
+        self._artists: list[dict] = []
+        self._artist_tracks: list[Track] = []
+        self._artists_loaded = False
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Lazy-load per subtab: bij eerste openen data vullen + focus op de
+        tabel zodat Enter meteen werkt. Wordt voor álle (geneste) TabbedContents
+        in de subtree afgevuurd, dus filteren op pane.id."""
+        pid = getattr(event.pane, "id", None)
+        if pid == "lib-spotify":
+            if not self._spotify_loaded:
+                self._spotify_loaded = True
+                asyncio.create_task(self.refresh_spotify(self._app))
+            self.query_one("#lib-spotify-meta", DataTable).focus()
+        elif pid == "ll-folders":
+            if not self._folder_loaded:
+                self._folder_loaded = True
+                asyncio.create_task(self._load_folder(()))
+            else:
+                self.query_one("#lib-folders-table", DataTable).focus()
+        elif pid == "ll-albums":
+            if not self._albums_loaded:
+                self._albums_loaded = True
+                asyncio.create_task(self._init_albums())
+            else:
+                self.query_one("#lib-albums-meta", DataTable).focus()
+        elif pid == "ll-artists":
+            if not self._artists_loaded:
+                self._artists_loaded = True
+                asyncio.create_task(self._init_artists())
+            else:
+                self.query_one("#lib-artists-meta", DataTable).focus()
+        elif pid == "lib-youtube":
+            if not self._yt_loaded:
+                self._yt_loaded = True
+                # vul de meta-tabel met de 4 vaste feeds (geen netwerk-call
+                # hier — pas bij Enter wordt de YouTubeSearch aangeroepen).
+                self._render_yt_meta()
+            self.query_one("#lib-yt-meta", DataTable).focus()
+
+    def compose(self) -> ComposeResult:
+        with TabbedContent(initial="lib-local"):
+            with TabPane("Lokaal", id="lib-local"):
+                # Lokaal is zelf ook een TabbedContent: Nummers / Mappen / Albums
+                # / Artiesten. TabActivated filtert op pane-id (zie memory-punt #4).
+                with TabbedContent(id="lib-local-tabs", initial="ll-tracks"):
+                    with TabPane("Nummers", id="ll-tracks"):
+                        # Platte lijst van de 500 laatst-toegevoegde tracks.
+                        yield DataTable(id="lib-local-table", cursor_type="row")
+                    with TabPane("Mappen", id="ll-folders"):
+                        # Breadcrumb boven, folder-tabel onder. Vertical met
+                        # 1fr-wrap zodat de tabel z'n viewport vult (anders
+                        # neemt hij auto-hoogte aan = alle rijen = scroll-bug;
+                        # zie memory-punt #8).
+                        with Vertical(id="lib-folders-wrap"):
+                            yield Label("📁 Music", id="lib-folders-path")
+                            yield DataTable(id="lib-folders-table",
+                                            cursor_type="row")
+                    with TabPane("Albums", id="ll-albums"):
+                        # Spotify-sjabloon: meta-links + detail-rechts (Horizontal
+                        # met height:1fr rekt de detail-tabel verticaal uit).
+                        with Horizontal(id="lib-albums"):
+                            yield DataTable(id="lib-albums-meta",
+                                            cursor_type="row")
+                            yield DataTable(id="lib-albums-detail",
+                                            cursor_type="row")
+                    with TabPane("Artiesten", id="ll-artists"):
+                        with Horizontal(id="lib-artists"):
+                            yield DataTable(id="lib-artists-meta",
+                                            cursor_type="row")
+                            yield DataTable(id="lib-artists-detail",
+                                            cursor_type="row")
+            with TabPane("Spotify", id="lib-spotify"):
+                # albums/playlists links, track-lijst rechts — altijd beide
+                # zichtbaar, zodat drill-down niet in een weggedrukte tabel
+                # onder de vouw verdwijnt.
+                with Horizontal(id="lib-spotify-split"):
+                    with Vertical(id="lib-spotify-left"):
+                        yield DataTable(id="lib-spotify-meta", cursor_type="row")
+                        yield Label("(Spotify-tabbladen vullen zodra ingelogd)",
+                                    id="lib-spotify-hint")
+                    yield DataTable(id="lib-detail-table", cursor_type="row")
+            with TabPane("YouTube", id="lib-youtube"):
+                # Subs/Favorieten/Watch Later/History links (meta),
+                # video-lijst rechts (detail). Vereist cookies_from_browser
+                # in config voor subscriptions/favorites/etc.
+                with Horizontal(id="lib-yt-split"):
+                    with Vertical(id="lib-yt-left"):
+                        yield DataTable(id="lib-yt-meta", cursor_type="row")
+                        yield Label("(zet [youtube] cookies_from_browser in config.toml "
+                                    "voor subscriptions)", id="lib-yt-hint")
+                    yield DataTable(id="lib-yt-detail", cursor_type="row")
+
+    def on_mount(self) -> None:
+        self.query_one("#lib-local-table", DataTable).add_columns("♪", "Titel", "Artiest", "Album", "Duur")
+        # Lokaal-subtabs (Mappen / Albums / Artiesten)
+        self.query_one("#lib-folders-table", DataTable).add_columns("Naam", "Type", "#")
+        self.query_one("#lib-albums-meta", DataTable).add_columns("Album", "Artiest", "#")
+        self.query_one("#lib-albums-detail", DataTable).add_columns("♪", "Titel", "Artiest", "Album", "Duur")
+        self.query_one("#lib-artists-meta", DataTable).add_columns("Artiest", "#")
+        self.query_one("#lib-artists-detail", DataTable).add_columns("♪", "Titel", "Album", "Duur")
+        # Spotify
+        self.query_one("#lib-spotify-meta", DataTable).add_columns("Naam", "Type", "Eigenaar")
+        self.query_one("#lib-detail-table", DataTable).add_columns("♪", "Titel", "Artiest", "Album", "Duur")
+        # YouTube
+        self.query_one("#lib-yt-meta", DataTable).add_columns("Naam", "Type")
+        self.query_one("#lib-yt-detail", DataTable).add_columns("♪", "Titel", "Kanaal", "Duur")
+
+    def render_library(self, tracks: list[Track]) -> None:
+        tbl = self.query_one("#lib-local-table", DataTable)
+        tbl.clear()
+        for i, t in enumerate(tracks):
+            tbl.add_row(t.badge, t.title, t.artist, t.album,
+                        _fmt_duration(t.duration), key=f"l:{i}")
+        # apart van self._tracks (Spotify-drill); anders zou Lokaal-tab de
+        # drill-tracks overschrijven.
+        self._local_tracks: list[Track] = tracks
+
+    async def refresh_spotify(self, app: "MusiApp") -> None:
+        """Vul de Spotify-tabel met Liked songs en lijst van playlists/albums."""
+        sp = app.services.providers.get("spotify")
+        if sp is None:
+            return
+        # laat de UI niet blokkeren — fetch in threads
+        try:
+            saved = await sp.saved_tracks(limit=200)
+            albums = await sp.saved_albums(limit=100)
+            playlists = await sp.user_playlists(limit=100)
+        except Exception as e:
+            app.notify(f"Spotify-library ophalen mislukte: {e}", severity="warning")
+            return
+        # Een autorisatiefout (bijv. invalid_client door fout client_id, of een
+        # niet-geregistreerde redirect_uri) wordt in de provider opgevangen en levert
+        # lege lijsten op — toon de échte oorzaak i.p.v. een stilletjes leeg tabblad.
+        if not saved and not albums and not playlists and getattr(sp, "last_error", None):
+            err = sp.last_error
+            self.query_one("#lib-spotify-hint", Label).update(f"⚠ Spotify-login mislukt: {err}")
+            app.notify(
+                f"Spotify-login mislukt: {err}\n"
+                "Check client_id + redirect_uri in ~/.config/musi/config.toml.",
+                severity="error",
+            )
+            return
+        # detail-tabel vullen met Liked songs
+        dt = self.query_one("#lib-detail-table", DataTable)
+        dt.clear()
+        self._tracks = saved
+        for i, t in enumerate(saved):
+            dt.add_row(t.badge, t.title, t.artist, t.album,
+                       _fmt_duration(t.duration), key=f"s:{i}")
+        # cache de volledige album-/playlist-objecten zodat drill-down de
+        # albumhoes (art_url) kan doorgeven aan de geladen tracks.
+        self._albums_by_uri = {a.get("uri"): a for a in albums}
+        self._playlists_by_uri = {p.get("uri"): p for p in playlists}
+        # meta-tabel met albums + playlists
+        mt = self.query_one("#lib-spotify-meta", DataTable)
+        mt.clear()
+        for i, a in enumerate(albums):
+            mt.add_row((a.get("name") or "?"), "album",
+                       ", ".join(ar["name"] for ar in a.get("artists") or []), key=f"a:{a.get('uri')}")
+        for i, p in enumerate(playlists):
+            owner = (p.get("owner") or {}).get("display_name") or "—"
+            mt.add_row((p.get("name") or "?"), "playlist", owner,
+                       key=f"p:{p.get('uri')}")
+        hint = self.query_one("#lib-spotify-hint", Label)
+        hint.update(
+            f"Liked songs: {len(saved)}  ·  Albums: {len(albums)}  ·  "
+            f"Playlists: {len(playlists)}  —  Enter op een album/playlist opent 'm"
+        )
+
+    async def action_play_now(self) -> None:
+        # Enter is contextbewust op basis van FOCUS — eerst leaf/detail (speel
+        # één track), daarna meta/folder (drill of daal af).
+        local = self.query_one("#lib-local-table", DataTable)
+        if local.has_focus:
+            idx = self._row_index(local, "l:")
+            if idx is not None and idx < len(self._local_tracks):
+                await self._app.play_track(self._local_tracks[idx])
+            return
+
+        # Lokaal > Mappen: subfolder → daal af, track → speel.
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            idx = self._row_index(folders, "f:")
+            if idx is not None and idx < len(self._folder_entries):
+                kind, val = self._folder_entries[idx]
+                if kind == "dir":
+                    await self._folder_descend(str(val))
+                else:
+                    await self._app.play_track(val)  # type: ignore[arg-type]
+            return
+
+        # Lokaal > Albums: meta → drill, detail → speel.
+        alb_detail = self.query_one("#lib-albums-detail", DataTable)
+        if alb_detail.has_focus:
+            idx = self._row_index(alb_detail, "at:")
+            if idx is not None and idx < len(self._album_tracks):
+                await self._app.play_track(self._album_tracks[idx])
+            return
+
+        # Lokaal > Artiesten.
+        art_detail = self.query_one("#lib-artists-detail", DataTable)
+        if art_detail.has_focus:
+            idx = self._row_index(art_detail, "rt:")
+            if idx is not None and idx < len(self._artist_tracks):
+                await self._app.play_track(self._artist_tracks[idx])
+            return
+
+        # Spotify track-lijst (drill of Liked songs).
+        detail = self.query_one("#lib-detail-table", DataTable)
+        if detail.has_focus:
+            if not self._tracks:
+                return
+            idx = self._selected_detail_index()
+            if idx is None:
+                return
+            await self._app.play_track(self._tracks[idx])
+            return
+
+        # Lokaal > Albums-meta: drill album.
+        alb_meta = self.query_one("#lib-albums-meta", DataTable)
+        if alb_meta.has_focus:
+            idx = self._row_index(alb_meta, "al:")
+            if idx is not None and idx < len(self._albums):
+                await self._drill_album(idx)
+            return
+
+        # Lokaal > Artiesten-meta: drill artiest.
+        art_meta = self.query_one("#lib-artists-meta", DataTable)
+        if art_meta.has_focus:
+            idx = self._row_index(art_meta, "ar:")
+            if idx is not None and idx < len(self._artists):
+                await self._drill_artist(idx)
+            return
+
+        # Library > YouTube: detail speelt, meta drillt.
+        yt_detail = self.query_one("#lib-yt-detail", DataTable)
+        if yt_detail.has_focus:
+            idx = self._yt_detail_index()
+            if idx is not None and idx < len(self._tracks):
+                await self._app.play_track(self._tracks[idx])
+            return
+        yt_meta = self.query_one("#lib-yt-meta", DataTable)
+        if yt_meta.has_focus:
+            await self._open_yt_collection()
+            return
+
+        # Spotify meta: drill album/playlist.
+        meta = self.query_one("#lib-spotify-meta", DataTable)
+        try:
+            meta_key = meta.coordinate_to_cell_key(meta.cursor_coordinate).row_key.value
+        except Exception:
+            meta_key = None
+        if meta_key and (meta_key.startswith("a:") or meta_key.startswith("p:")):
+            await self._open_spotify_collection()
+
+    def _row_index(self, tbl: DataTable, prefix: str) -> int | None:
+        """Algemene helper: geef de int-index uit de cursor-rij-key van tbl,
+        mits die met `prefix` begint (anders None)."""
+        if tbl.row_count == 0:
+            return None
+        try:
+            key = tbl.coordinate_to_cell_key(tbl.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        if not key or not key.startswith(prefix):
+            return None
+        try:
+            return int(key[len(prefix):])
+        except ValueError:
+            return None
+
+    async def _open_spotify_collection(self) -> None:
+        """Laad de tracks van het geselecteerde album/playlist in de track-lijst."""
+        meta = self.query_one("#lib-spotify-meta", DataTable)
+        try:
+            key = meta.coordinate_to_cell_key(meta.cursor_coordinate).row_key.value
+        except Exception:
+            return
+        if not key or not self._app:
+            return
+        sp = self._app.services.providers.get("spotify")
+        if sp is None:
+            return
+        uri = key[2:]  # strip prefix "a:" of "p:"; de rest is de Spotify-URI
+        try:
+            if key.startswith("a:"):
+                art = _art_from_collection(self._albums_by_uri.get(uri, {}))
+                tracks = await sp.album_tracks(uri, limit=300, art_url=art)
+                label = "album"
+            elif key.startswith("p:"):
+                tracks = await sp.playlist_tracks(uri, limit=300)
+                label = "playlist"
+            else:
+                return
+        except Exception as e:
+            self._app.notify(f"Collectie laden mislukte: {e}", severity="warning")
+            return
+        self._tracks = tracks
+        dt = self.query_one("#lib-detail-table", DataTable)
+        dt.clear()
+        for i, t in enumerate(tracks):
+            dt.add_row(t.badge, t.title, t.artist, t.album,
+                       _fmt_duration(t.duration), key=f"s:{i}")
+        dt.focus()  # volgende Enter speelt een nummer uit de track-lijst
+        self.query_one("#lib-spotify-hint", Label).update(
+            f"{label.capitalize()}: {len(tracks)} nummers geladen — "
+            "Enter = spelen, a = toevoegen aan queue"
+        )
+
+    async def action_add_to_queue(self) -> None:
+        # `a`: voeg toe aan queue.
+        # - leaf-tabel (lokaal/folder-track/album-detail/artist-detail/spotify-detail) → die track.
+        # - meta/folder-subfolder → álles van dat album/artiest/map (queue_extend, 1 event).
+        local = self.query_one("#lib-local-table", DataTable)
+        if local.has_focus:
+            idx = self._row_index(local, "l:")
+            if idx is not None and idx < len(self._local_tracks):
+                self._app.orchestrator.queue_add(self._local_tracks[idx])
+            return
+
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            idx = self._row_index(folders, "f:")
+            if idx is not None and idx < len(self._folder_entries):
+                kind, val = self._folder_entries[idx]
+                if kind == "dir":
+                    tracks = await self._run(
+                        self._app.services.library.folder_tracks,
+                        (*self._folder_rel, str(val)),
+                    )
+                    self._app.orchestrator.queue_extend(tracks)
+                    self._app.notify(f"+{len(tracks)} uit map '{val}'")
+                else:
+                    self._app.orchestrator.queue_add(val)  # type: ignore[arg-type]
+            return
+
+        alb_detail = self.query_one("#lib-albums-detail", DataTable)
+        if alb_detail.has_focus:
+            idx = self._row_index(alb_detail, "at:")
+            if idx is not None and idx < len(self._album_tracks):
+                self._app.orchestrator.queue_add(self._album_tracks[idx])
+            return
+
+        art_detail = self.query_one("#lib-artists-detail", DataTable)
+        if art_detail.has_focus:
+            idx = self._row_index(art_detail, "rt:")
+            if idx is not None and idx < len(self._artist_tracks):
+                self._app.orchestrator.queue_add(self._artist_tracks[idx])
+            return
+
+        # Spotify drill-detail.
+        if not self._tracks:
+            return
+        idx = self._selected_detail_index()
+        if idx is None:
+            return
+        self._app.orchestrator.queue_add(self._tracks[idx])
+
+    # ---- tag-editor + delete ------------------------------------
+    # `e` op een lokale track-rij → EditTagsModal → mutagen write + DB update.
+    # `d` op een lokale track-rij → ConfirmModal → os.unlink + DB delete.
+    # YT-playlist-verwijderen is uit deze app gehaald: YouTube weigert
+    # `playlist_edit_ajax` met 401 voor niet-browser-clients.
+    #
+    # Modal-flow via **callback** (geen `wait_for_dismiss`). De action awaited
+    # NIET op de dismiss-waarde: Textual's `_on_key` await de action op de App-
+    # pump, dus elke action die wacht op een modal-blocking-Future **deadlockt**:
+    # de button-press die `dismiss()` zou moeten triggeren kan niet verwerkt
+    # worden terwijl de App-pump in de action zit. Eerder experiment met
+    # ``run_worker + push_screen(wait_for_dismiss=True)`` en
+    # ``push_screen_wait`` (asyncio.shield) had exact hetzelfde deadlock-
+    # symptoom — werkende Unit-test met directe-dismiss (``dismiss(True)``
+    # in ``on_mount``) bleek vals-positief omdat die de button-press-stap
+    # omzeilt. De fix: modal pushen via ``push_screen(modal, callback=cb)``
+    # (synchroon, geen await), action keert meteen terug, dismiss-waarde
+    # komt binnen via ``cb`` op de App-pump. Zie ``test_deadlock.py``.
+
+    async def action_edit_tags(self) -> None:
+        track = self._focused_local_track()
+        if track is None:
+            self._app.notify("Geen lokale track geselecteerd (alleen tags "
+                             "van lokale nummers zijn bewerkbaar).")
+            return
+        lib = self._app.services.library
+        # Huidige tags uit het bestand lezen (genre zit niet in de DB).
+        try:
+            current = await self._run(lib.read_tags, track.uri)
+        except Exception as e:
+            self._app.notify(f"Tags lezen mislukte: {e}", severity="error")
+            return
+        # Sla de context op voor de callback; de action moet non-blocking
+        # terugkeren — zie de deadlock-docstring bovenaan dit blok.
+        self._pending_edit_track = track
+        self._app.push_screen(
+            EditTagsModal(track.uri, **current),
+            callback=self._on_edit_tags_result,
+        )
+
+    def _on_edit_tags_result(self, result) -> None:
+        """Dismiss-callback van EditTagsModal. Draait op de App-pump."""
+        track = getattr(self, "_pending_edit_track", None)
+        self._pending_edit_track = None
+        if not track or not result:
+            return  # geannuleerd of context kwijt
+        # Het zware werk (file-write + DB) gaat via een aparte task zodat
+        # de App-pump niet blokkeert. ``self._run`` await ``asyncio.to_thread``.
+        asyncio.create_task(self._apply_tag_edits(track, result))
+
+    async def _apply_tag_edits(self, track, result: dict) -> None:
+        lib = self._app.services.library
+        try:
+            await self._run(lib.update_tags, track.uri,
+                            title=result.get("title", ""),
+                            artist=result.get("artist", ""),
+                            album=result.get("album", ""),
+                            genre=result.get("genre", ""))
+        except Exception as e:
+            self._app.notify(f"Tags schrijven mislukte: {e}", severity="error")
+            return
+        # In-memory Track bijwerken zodat de UI de nieuwe waarden toont.
+        if title := result.get("title"):
+            track.title = title
+        if artist := result.get("artist"):
+            track.artist = artist
+        if album := result.get("album"):
+            track.album = album
+        await self._rerender_focused_local_table()
+        self._app.notify(f"Tags bijgewerkt: {os.path.basename(track.uri)}")
+
+    async def action_delete_or_remove(self) -> None:
+        # YT-playlist-verwijderen is uit deze app gehaald: YouTube weigert
+        # `playlist_edit_ajax` met 401 voor niet-browser-clients (zelfs met
+        # geldige cookies). Verwijder ze via youtube.com of de YouTube-app.
+        # `d` werkt nu nog wel voor lokale nummers (ConfirmModal + unlink).
+        track = self._focused_local_track()
+        if track is None:
+            self._app.notify("Geen nummer geselecteerd om te verwijderen "
+                             "(YT-playlists: verwijderen via youtube.com).")
+            return
+        # Veiligheidscheck: speelt 'ie nu? mpv houdt de fd vast, dus unlink
+        # laat de file onzichtbaar op schijf tot mpv 'm sluit — verwarrend.
+        cur = self._app.orchestrator.state.track
+        if cur and cur.uri == track.uri:
+            self._app.notify(f"Speelt nu — kan '{track.title}' niet wissen.",
+                             severity="warning")
+            return
+        path = track.uri
+        title = track.title or os.path.basename(path)
+        # Sla context op voor de dismiss-callback; action moet non-blocking
+        # terugkeren — anders deadlock (zie de deadlock-docstring bovenaan dit blok).
+        self._pending_delete_path = path
+        self._pending_delete_title = title
+        self._app.push_screen(
+            ConfirmModal("Bestand definitief wissen?", f"{title}\n{path}"),
+            callback=self._on_delete_confirm,
+        )
+
+    def _on_delete_confirm(self, ok: bool) -> None:
+        """Dismiss-callback van ConfirmModal (delete)."""
+        path = getattr(self, "_pending_delete_path", None)
+        title = getattr(self, "_pending_delete_title", "")
+        self._pending_delete_path = None
+        self._pending_delete_title = ""
+        if not ok or path is None:
+            return
+        # Het zware werk (file-delete + DB) gaat via een aparte task.
+        asyncio.create_task(self._apply_delete(path, title))
+
+    async def _apply_delete(self, path: str, title: str) -> None:
+        lib = self._app.services.library
+        try:
+            await self._run(lib.delete_track, path)
+        except Exception as e:
+            self._app.notify(f"Wissen mislukte: {e}", severity="error")
+            return
+        await self._rerender_focused_local_table()
+        self._app.notify(f"Verwijderd: {title}")
+
+    def _focused_local_track(self) -> Track | None:
+        """Geef de Track van de gefocuste rij in een lokale track-tabel, of
+        ``None`` als de focus elders ligt (meta-rij, YT, Spotify)."""
+        local = self.query_one("#lib-local-table", DataTable)
+        if local.has_focus:
+            idx = self._row_index(local, "l:")
+            if idx is not None and idx < len(self._local_tracks):
+                return self._local_tracks[idx]
+            return None
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            idx = self._row_index(folders, "f:")
+            if idx is not None and idx < len(self._folder_entries):
+                kind, val = self._folder_entries[idx]
+                if kind == "track":
+                    return val  # type: ignore[return-value]
+            return None
+        alb = self.query_one("#lib-albums-detail", DataTable)
+        if alb.has_focus:
+            idx = self._row_index(alb, "at:")
+            if idx is not None and idx < len(self._album_tracks):
+                return self._album_tracks[idx]
+            return None
+        art = self.query_one("#lib-artists-detail", DataTable)
+        if art.has_focus:
+            idx = self._row_index(art, "rt:")
+            if idx is not None and idx < len(self._artist_tracks):
+                return self._artist_tracks[idx]
+            return None
+        return None
+
+    async def _rerender_focused_local_table(self) -> None:
+        """Herlaad de gefocuste lokale track-tabel vanuit de library (na
+        edit/delete). Cursor-positie reset naar rij 0 — acceptabel voor de
+        zelden-gebruikte-mutatie-flow."""
+        local = self.query_one("#lib-local-table", DataTable)
+        if local.has_focus:
+            tracks = await self._run(self._app.services.library.recent)
+            self.render_library(tracks)
+            return
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            await self._load_folder(self._folder_rel)
+            return
+        alb = self.query_one("#lib-albums-detail", DataTable)
+        if alb.has_focus and self._album_tracks:
+            album = self._album_tracks[0].album
+            tracks = await self._run(self._app.services.library.album_tracks, album)
+            self._album_tracks = tracks
+            alb.clear()
+            for i, t in enumerate(tracks):
+                alb.add_row(t.badge, t.title, t.artist, t.album,
+                            _fmt_duration(t.duration), key=f"at:{i}")
+            return
+        art = self.query_one("#lib-artists-detail", DataTable)
+        if art.has_focus and self._artist_tracks:
+            artist = self._artist_tracks[0].artist
+            tracks = await self._run(self._app.services.library.artist_tracks, artist)
+            self._artist_tracks = tracks
+            art.clear()
+            for i, t in enumerate(tracks):
+                art.add_row(t.badge, t.title, t.album,
+                            _fmt_duration(t.duration), key=f"rt:{i}")
+
+    # ---- Lokaal-subtabs helpers --------------------------------------
+    async def _run(self, fn, *args, **kwargs):
+        """Library-call in een thread om de UI-loop niet te blokkeren."""
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _load_folder(self, rel: tuple[str, ...]) -> None:
+        """Vul #lib-folders-table met de directe kinderen van map `rel`."""
+        lib = self._app.services.library
+        subs, tracks = await self._run(lib.folder_entries, rel)
+        self._folder_rel = tuple(rel)
+        tbl = self.query_one("#lib-folders-table", DataTable)
+        tbl.clear()
+        entries: list[tuple[str, object]] = []
+        # mappen eerst (alfabetisch), dan tracks
+        for name, cnt in subs:
+            i = len(entries)
+            entries.append(("dir", name))
+            tbl.add_row(f"📁 {name}", "map", f"{cnt}×", key=f"f:{i}")
+        for t in tracks:
+            i = len(entries)
+            entries.append(("track", t))
+            tbl.add_row(f"♪ {t.title}", t.artist or "", _fmt_duration(t.duration),
+                        key=f"f:{i}")
+        self._folder_entries = entries
+        self.query_one("#lib-folders-path", Label).update(
+            "📁 " + "/".join(["Music", *self._folder_rel])
+        )
+        tbl.focus()
+        tbl.move_cursor(row=0)
+
+    async def _folder_descend(self, name: str) -> None:
+        await self._load_folder((*self._folder_rel, name))
+
+    async def _folder_ascend(self) -> None:
+        if self._folder_rel:
+            await self._load_folder(self._folder_rel[:-1])
+
+    async def _init_albums(self) -> None:
+        lib = self._app.services.library
+        albums = await self._run(lib.albums)
+        self._albums = albums
+        mt = self.query_one("#lib-albums-meta", DataTable)
+        mt.clear()
+        for i, a in enumerate(albums):
+            mt.add_row(a["album"], a["artist"], f"{a['count']}", key=f"al:{i}")
+        mt.focus()
+        mt.move_cursor(row=0)
+
+    async def _drill_album(self, idx: int) -> None:
+        lib = self._app.services.library
+        album = self._albums[idx]["album"]
+        tracks = await self._run(lib.album_tracks, album)
+        self._album_tracks = tracks
+        dt = self.query_one("#lib-albums-detail", DataTable)
+        dt.clear()
+        for i, t in enumerate(tracks):
+            dt.add_row(t.badge, t.title, t.artist, t.album,
+                       _fmt_duration(t.duration), key=f"at:{i}")
+        dt.focus()
+        dt.move_cursor(row=0)
+        self._app.notify(f"{album}: {len(tracks)} nummers")
+
+    async def _init_artists(self) -> None:
+        lib = self._app.services.library
+        artists = await self._run(lib.artists)
+        self._artists = artists
+        mt = self.query_one("#lib-artists-meta", DataTable)
+        mt.clear()
+        for i, a in enumerate(artists):
+            mt.add_row(a["artist"], f"{a['count']}", key=f"ar:{i}")
+        mt.focus()
+        mt.move_cursor(row=0)
+
+    async def _drill_artist(self, idx: int) -> None:
+        lib = self._app.services.library
+        artist = self._artists[idx]["artist"]
+        tracks = await self._run(lib.artist_tracks, artist)
+        self._artist_tracks = tracks
+        dt = self.query_one("#lib-artists-detail", DataTable)
+        dt.clear()
+        for i, t in enumerate(tracks):
+            dt.add_row(t.badge, t.title, t.album,
+                       _fmt_duration(t.duration), key=f"rt:{i}")
+        dt.focus()
+        dt.move_cursor(row=0)
+        self._app.notify(f"{artist}: {len(tracks)} nummers")
+
+    # ---- key bindings (BINDINGS) ------------------------------------
+    def action_go_up(self) -> None:
+        """Mappen-tab: één niveau omhoog (no-op als we al in root staan).
+        Werkt alleen als focus in de Mappen-tab is."""
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus and self._folder_rel:
+            asyncio.create_task(self._folder_ascend())
+
+    async def action_play_all_context(self) -> None:
+        """Speel alles van huidige context — vervangt queue + speel index 0.
+        Werkt in Mappen (huidige map recursief), Albums/Artiesten-meta (geheel),
+        en op detail-tabellen (alle geladen tracks)."""
+        lib = self._app.services.library
+        orch = self._app.orchestrator
+        folders = self.query_one("#lib-folders-table", DataTable)
+        if folders.has_focus:
+            tracks = await self._run(lib.folder_tracks, self._folder_rel)
+            await orch.play_all(tracks)
+            self._app.notify(f"▶ {len(tracks)} uit huidige map")
+            return
+        alb_meta = self.query_one("#lib-albums-meta", DataTable)
+        if alb_meta.has_focus:
+            idx = self._row_index(alb_meta, "al:")
+            if idx is not None and idx < len(self._albums):
+                tracks = await self._run(lib.album_tracks, self._albums[idx]["album"])
+                await orch.play_all(tracks)
+                self._app.notify(f"▶ album '{self._albums[idx]['album']}' ({len(tracks)})")
+            return
+        art_meta = self.query_one("#lib-artists-meta", DataTable)
+        if art_meta.has_focus:
+            idx = self._row_index(art_meta, "ar:")
+            if idx is not None and idx < len(self._artists):
+                tracks = await self._run(lib.artist_tracks, self._artists[idx]["artist"])
+                await orch.play_all(tracks)
+                self._app.notify(f"▶ artiest '{self._artists[idx]['artist']}' ({len(tracks)})")
+            return
+        alb_detail = self.query_one("#lib-albums-detail", DataTable)
+        if alb_detail.has_focus and self._album_tracks:
+            await orch.play_all(self._album_tracks)
+            self._app.notify(f"▶ {len(self._album_tracks)} album-tracks")
+            return
+        art_detail = self.query_one("#lib-artists-detail", DataTable)
+        if art_detail.has_focus and self._artist_tracks:
+            await orch.play_all(self._artist_tracks)
+            self._app.notify(f"▶ {len(self._artist_tracks)} artiest-tracks")
+
+    def _selected_detail_index(self) -> int | None:
+        return self._row_index(self.query_one("#lib-detail-table", DataTable), "s:")
+
+    # ---- Library > YouTube helpers ------------------------------------
+    def _render_yt_meta(self) -> None:
+        """Vul #lib-yt-meta met de 4 vaste feeds (subs/favorites/WL/history).
+        Geen netwerk-call — pas bij drill (Enter) wordt YouTubeSearch aangeroepen."""
+        feeds = [
+            ("sub:", "📺 Subscriptions", "subscriptions"),
+            ("fav:", "★ Favorieten", "favorites"),
+            ("wl:",  "📜 Watch Later", "watch_later"),
+            ("h:",   "▶ History", "history"),
+        ]
+        self._yt_meta_rows = [{"key": k, "label": label, "method": method}
+                              for k, label, method in feeds]
+        mt = self.query_one("#lib-yt-meta", DataTable)
+        mt.clear()
+        for row in self._yt_meta_rows:
+            mt.add_row(row["label"], row["method"].replace("_", " "), key=row["key"])
+        # hint aanpassen op basis van cookies-config
+        hint = self.query_one("#lib-yt-hint", Label)
+        yt = self._app.services.providers.get("youtube")
+        cfb = getattr(yt, "_cookies_from_browser", "") if yt else ""
+        if not cfb:
+            hint.update("⚠ zet [youtube] cookies_from_browser in config.toml "
+                        "voor subscriptions/favorieten")
+
+    async def _open_yt_collection(self) -> None:
+        """Drill: lees geselecteerde meta-rij → laad bijbehorende feed."""
+        meta = self.query_one("#lib-yt-meta", DataTable)
+        try:
+            key = meta.coordinate_to_cell_key(meta.cursor_coordinate).row_key.value
+        except Exception:
+            return
+        if not key:
+            return
+        row = next((r for r in self._yt_meta_rows if r["key"] == key), None)
+        if not row:
+            return
+        yt = self._app.services.providers.get("youtube")
+        if yt is None:
+            self._app.notify("YouTube-provider niet beschikbaar", severity="error")
+            return
+        method = getattr(yt, row["method"], None)
+        if method is None:
+            self._app.notify(f"YouTube-feed '{row['method']}' ontbreekt", severity="error")
+            return
+        self.query_one("#lib-yt-hint", Label).update(f"{row['label']}: laden…")
+        try:
+            tracks = await method(limit=100)
+        except Exception as e:
+            self._app.notify(f"YouTube laden mislukte: {e}", severity="warning")
+            self.query_one("#lib-yt-hint", Label).update(
+                f"⚠ {row['label']}: {e}"
+            )
+            return
+        self._tracks = tracks
+        dt = self.query_one("#lib-yt-detail", DataTable)
+        dt.clear()
+        for i, t in enumerate(tracks):
+            dt.add_row(t.badge, t.title, t.artist, _fmt_duration(t.duration),
+                       key=f"yt:{i}")
+        self.query_one("#lib-yt-hint", Label).update(
+            f"{row['label']}: {len(tracks)} video's — Enter = spelen, V = video"
+        )
+        dt.focus()
+        dt.move_cursor(row=0)
+        if not tracks:
+            self._app.notify(
+                f"Geen video's in {row['label']}. "
+                "Ingelogd in je browser? cookies_from_browser in config.toml?",
+                severity="warning",
+            )
+
+    def _yt_detail_index(self) -> int | None:
+        return self._row_index(self.query_one("#lib-yt-detail", DataTable), "yt:")
+
+
+class MusiApp(App):
+    """De Textual-app: Header + TabbedContent(Zoeken/Queue/Library) +
+    NowPlaying-footer + Footer met keybindings.
+
+    Lifecycle (``cli._run_tui``):
+      1. ``MusiApp(orch, sv, cfg)`` — krijgt orchestrator + services + config.
+      2. ``on_mount`` koppelt de orchestrator-event-callback, geeft de LibraryPane
+         een app-referentie (die had 'm niet tijdens compose), en start een
+         achtergrondtaak voor de library-rescan + render.
+      3. ``app.run_async()`` draait tot de gebruiker ``q`` drukt.
+
+    Wat het doet met binnenkomende events (``_on_orch_event``):
+      * ``"state"`` → update NowPlaying (track/positie/duur/status).
+      * ``"queue"`` → render QueuePane opnieuw.
+      * ``"error"`` → log (de UI toont 'm via de statusbalk; engine-fouten komen
+        zelden voor want elke engine call wordt in de orchestrator opgevangen).
+
+    De V-toets (``action_toggle_video``) spawnt een aparte mpv-instantie als
+    **video-viewer** naast de audio-engine — zie de methode voor details.
+    """
+
+    CSS = """
+    Screen { layout: vertical; }
+    #main { height: 1fr; }
+    NowPlaying { dock: bottom; height: 1; padding: 0 1; background: $boost; }
+    SearchPane, QueuePane, LibraryPane { height: 1fr; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("slash", "focus_search", "Zoeken"),
+        Binding("1", "tab('search')", "Zoeken"),
+        Binding("2", "tab('queue')", "Queue"),
+        Binding("3", "tab('library')", "Library"),
+        Binding("space", "toggle_pause", "Play/Pause"),
+        Binding("n", "next", "Volgende"),
+        Binding("p", "prev", "Vorige"),
+        Binding("plus", "vol_up", "Volume +"),
+        Binding("minus", "vol_down", "Volume -"),
+        Binding("c", "clear_queue", "Wis queue"),
+        Binding("v", "toggle_video", "Video"),
+    ]
+
+    results: reactive[list[Track]] = reactive(list, recompose=False)
+
+    def __init__(self, orchestrator: Orchestrator, services: Services, cfg) -> None:
+        super().__init__()
+        self.orchestrator = orchestrator
+        self.services = services
+        self.cfg = cfg
+        # V-toets: aparte mpv-instantie als pure video-viewer (geen IPC, geen
+        # orchestrator-koppeling). De hoofd-mpv speelt door — alleen deze
+        # tweede mpv wordt aan/uit gezet.
+        self._video_proc: asyncio.subprocess.Process | None = None
+        # ---- auto-rip: elke YouTube-track die écht speelt → mp3 in ~/Music ----
+        # De UI bepaalt wánneer (nieuwe YT-track + ~5s grace), Ripper doet de
+        # extractie+organize. Sessie-sets deduppen; rips.json dedup't cross-sessie.
+        self._ripper = Ripper(cfg.music_dir, cfg.cache_dir, cfg.yt_cookies_from_browser)
+        self._rip_pending: set[str] = set()   # video-ids met lopende grace-timer
+        self._rip_inflight: set[str] = set()  # video-ids die nu downlowaden
+        self._rip_done: set[str] = set()      # video-ids die deze sessie klaar zijn
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with TabbedContent(id="tabs", initial="tab-search"):
+            with TabPane("Zoeken", id="tab-search"):
+                yield SearchPane(self)
+            with TabPane("Queue", id="tab-queue"):
+                yield QueuePane()
+            with TabPane("Library", id="tab-library"):
+                yield LibraryPane(None)  # zodra compose zonder app; via on_mount zetten
+        yield NowPlaying(self.cfg.cache_dir / "art", id="now-playing")
+        yield Footer()
+
+    # ---- acties -----------------------------------------------------
+    async def on_mount(self) -> None:
+        self.title = "musi"
+        self.sub_title = "lokaal · YouTube · Spotify"
+        # orchestrator-event koppeling
+        self.orchestrator._event_cb = self._on_orch_event  # type: ignore[attr-defined]
+        # library-tabbladen krijgen een app-referentie (na constructie)
+        lib = self.query_one(LibraryPane)
+        lib._app = self
+        # library vullen (async, in thread)
+        asyncio.create_task(self._refresh_library())
+        # Spotify-library wordt LAZY geladen bij het openen van de Spotify-tab
+        # (anders triggert elke opstart de OAuth-browser-flow).
+
+    async def _refresh_library(self) -> None:
+        # Herscan (pikt nieuwe/gewijzigde bestanden op; snel via mtime-cache)
+        # en daarna recente tracks laden + renderen. In threads om de UI niet
+        # te blokkeren. Loopt vanuit on_mount, dus het scherm bestaat hier.
+        try:
+            await asyncio.to_thread(self.services.library.rescan)
+            tracks = await asyncio.to_thread(self.services.library.recent, 500)
+            self.query_one(LibraryPane).render_library(tracks)
+        except Exception as e:
+            log.warning("library-refresh mislukt: %s", e)
+
+    async def _refresh_spotify_library(self) -> None:
+        try:
+            await self.query_one(LibraryPane).refresh_spotify(self)
+        except Exception as e:
+            self.notify(f"Spotify-library: {e}", severity="warning")
+
+    def _on_orch_event(self, ev: PlaybackEvent) -> None:
+        if ev.kind == "state" and ev.state is not None:
+            self.query_one(NowPlaying).update_from_state(ev.state)
+            # auto-rip: bij een YouTube-track plan een rip na de grace-periode.
+            # _schedule_rip dedup't op video-id (goedkoop, want dit vuurt bij
+            # elke positie-update). Spotify/lokaal worden hier stil genegeerd.
+            track = ev.state.track
+            if track is not None and track.source == "youtube":
+                self._schedule_rip(track)
+        elif ev.kind == "queue" and ev.queue is not None:
+            self.query_one(QueuePane).render_queue(ev.queue)
+
+    # ---- auto-rip (YouTube → mp3 in ~/Music) -------------------------
+    def _schedule_rip(self, track: Track) -> None:
+        """Plan een auto-rip voor een YouTube-track ná een korte grace-periode
+        (zie ``_rip_after_grace``). Dedup op video-id binnen de sessie:
+        pending/inflight/done → negeer. ``create_task`` zodat de handler direct
+        terugkeert (deze methode draait in de orchestrator state-callback)."""
+        vid = video_id(track)
+        if (not vid or vid in self._rip_pending
+                or vid in self._rip_inflight or vid in self._rip_done):
+            return
+        self._rip_pending.add(vid)
+        asyncio.create_task(self._rip_after_grace(track, vid))
+
+    async def _rip_after_grace(self, track: Track, vid: str,
+                               delay: float = 5.0) -> None:
+        """Wacht ``delay`` seconden; ript alleen als ``vid`` dan nog de actieve,
+        spelende track is. Zo trigger skippen door een queue (binnen de grace)
+        geen tientallen downloads. Bij overslaan halen we 'm uit ``_rip_pending``
+        zodat een latere herhaling 't wél opnieuw mag proberen.
+
+        Na de rip: ``library.rescan`` (pikt het nieuwe bestand op) + notify.
+        Fouten raken nooit de playback (de rip loopt volledig los van mpv)."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            self._rip_pending.discard(vid)
+            raise
+        # Nog steeds dezelfde track, en nog steeds aan 't spelen?
+        cur = self.orchestrator.state.track
+        playing = self.orchestrator.state.status.value == "playing"
+        if cur is None or video_id(cur) != vid or not playing:
+            self._rip_pending.discard(vid)
+            log.info("rip grace afgebroken voor %s (niet meer actief)", vid)
+            return
+        self._rip_pending.discard(vid)
+        self._rip_inflight.add(vid)
+        try:
+            res = await self._ripper.rip(track)
+        except Exception as e:
+            self._rip_inflight.discard(vid)
+            self._rip_done.add(vid)
+            self.notify(f"Rip mislukt: {e}", severity="error")
+            log.warning("rip faalde voor %s: %s", vid, e)
+            return
+        self._rip_inflight.discard(vid)
+        self._rip_done.add(vid)
+        if res.status == "done" and res.path is not None:
+            try:
+                await asyncio.to_thread(self.services.library.rescan)
+            except Exception as e:
+                log.warning("library-rescan na rip mislukte: %s", e)
+            try:
+                rel = os.path.relpath(res.path, self.cfg.music_dir)
+            except ValueError:
+                rel = str(res.path)  # ander volume → geen relpath
+            self.notify(f"💾 opgeslagen: {rel}")
+            log.info("rip opgeslagen: %s", res.path)
+        elif res.status == "exists":
+            log.debug("rip skipped (bestaat al): %s", vid)
+        else:
+            self.notify(f"Rip mislukt: {res.reason}", severity="error")
+            log.warning("rip faalde voor %s: %s", vid, res.reason)
+
+    async def _on_search_submit(self, query: str) -> None:
+        query = (query or "").strip()
+        if not query:
+            return
+        label = self.query_one("#search-source-label", Label)
+        label.update("zoeken…")
+        # Token-gebaseerd parsen van bron-prefix (``/yt`` …) én sort-flag
+        # (``/date``/``!date`` …). Beide mogen op elke positie en in willekeurige
+        # volgorde staan — "/yt /date lofi", "/date /yt lofi" en "!date /yt lofi"
+        # werken allemaal. We strippen de herkende tokens eruit; wat overblijft
+        # is de zoekterm (originele casing behouden).
+        SOURCE_PREFIX = {
+            "/yt": "youtube", "/youtube": "youtube",
+            "/lokaal": "local", "/local": "local", "/l": "local",
+            "/spotify": "spotify", "/sp": "spotify",
+        }
+        SORT_FLAGS = {
+            "!date": "date", "/date": "date",
+            "!new": "date", "/new": "date",
+            "!nieuw": "date", "/nieuw": "date",
+        }
+        source: str | None = None
+        sort = "relevance"
+        kept: list[str] = []
+        for tok in query.split():
+            low = tok.lower()
+            if low in SOURCE_PREFIX:
+                if source is None:
+                    source = SOURCE_PREFIX[low]
+                # dubbele bron-prefix negeren (niet als zoekterm gebruiken)
+            elif low in SORT_FLAGS:
+                sort = SORT_FLAGS[low]
+            else:
+                kept.append(tok)
+        query = " ".join(kept)
+        if not query:
+            return
+        # "datum" yt-dlp laat elke video resolv'en (flat-playlist levert geen
+        # upload-timestamp); ~30-60s voor 20 resultaten. Waarschuw de gebruiker
+        # één keer, zodat de "zoeken…" spinner niet voor een hang lijkt.
+        if sort == "date" and (source in (None, "youtube")):
+            self.notify("Sorteren op datum duurt ~30-60s (yt-dlp resolved elke video)…",
+                        timeout=4)
+
+        sel = self.services.providers
+        tasks: dict[str, Any] = {}
+        if source in (None, "local"):
+            tasks["local"] = sel["local"].search(query, limit=25)
+        if source in (None, "youtube"):
+            tasks["youtube"] = sel["youtube"].search(query, limit=15, sort=sort)
+        if source in (None, "spotify") and "spotify" in sel:
+            tasks["spotify"] = sel["spotify"].search(query, limit=20)
+        names = list(tasks.keys())
+        got = await asyncio.gather(*[tasks[n] for n in names])
+        by_source = dict(zip(names, got))
+        # volgorde: lokaal → youtube → spotify
+        results = (by_source.get("local", []) + by_source.get("youtube", [])
+                   + by_source.get("spotify", []))
+        self.results = results
+        bron = source or "alle"
+        delen = " · ".join(f"{len(by_source.get(n, []))} {n}" for n in names)
+        sort_txt = " · sort: datum" if sort == "date" else ""
+        label.update(f"bron: {bron} · {delen}{sort_txt}")
+        # Extra Datum/Views/Likes-kolommen tonen bij ``!date`` (alleen dáár
+        # heeft YouTube die data opgehaald — andere modi zouden de kolommen
+        # altijd leeg tonen).
+        self.query_one(SearchPane).watch_results(results, show_stats=(sort == "date"))
+
+    async def play_track(self, track: Track) -> None:
+        # wis de queue en begin met deze track, of voeg toe aan queue?
+        # We kiezen: als de queue leeg is, zet 'm erin en speel; anders voeg toe en speel.
+        self.orchestrator.queue.clear()
+        self.orchestrator.queue_add(track)
+        await self.orchestrator.play_index(0)
+
+    # ---- actie-handlers (BINDINGS) -----------------------------------
+    def action_focus_search(self) -> None:
+        self.query_one("#search-input", Input).focus()
+
+    async def action_toggle_pause(self) -> None:
+        """Spatie: wissel pauze/hervat op de actieve engine (no-op als er niets
+        speelt — zie ``orchestrator.toggle_pause`` voor het waarom)."""
+        await self.orchestrator.toggle_pause()
+
+    async def action_next(self) -> None:
+        """``n``: speel de volgende track (queue door)."""
+        await self.orchestrator.next()
+
+    async def action_prev(self) -> None:
+        """``p``: speel de vorige track."""
+        await self.orchestrator.prev()
+
+    async def action_vol_up(self) -> None:
+        """``+``: volume +5 (geklemd op 100)."""
+        cur = self.orchestrator.state.volume
+        await self.orchestrator.set_volume(min(100.0, cur + 5))
+
+    async def action_vol_down(self) -> None:
+        """``-``: volume -5 (geklemd op 0)."""
+        cur = self.orchestrator.state.volume
+        await self.orchestrator.set_volume(max(0.0, cur - 5))
+
+    async def action_clear_queue(self) -> None:
+        """Wis de hele queue."""
+        self.orchestrator.queue_clear()
+
+    async def action_toggle_video(self) -> None:
+        """V-toets: spawn een aparte mpv-instantie als **video-viewer** voor de
+        huidige YouTube-track; tweede V sluit het venster weer.
+
+        Werkt alleen als er een YouTube-track speelt. Bij niet-YouTube of geen
+        actieve track: notify + geen actie. Bij een lopende video-mpv: terminate
+        (kill na 2s timeout).
+
+        De video-mpv krijgt ``--ytdl-format=best`` (gecombineerde stream tot
+        1080p) — **niet** ``bestaudio`` (audio-only → leeg venster) en **niet**
+        ``bestvideo+bestaudio`` (twee DASH-streams die mpv niet altijd via EDL
+        kan muxen). De audio-mpv in de orchestrator blijft doorlopen — er
+        kunnen dus kort twee keer dezelfde stream lopen, maar dat is voor YouTube
+        acceptabel (en de voordelen van een robuuste viewer wegen zwaarder).
+
+        Bij het sluiten van de audio-track of de app: de video-mpv sluit
+        **niet** automatisch (kan bij live-uitzendingen nog relevant zijn);
+        gebruiker sluit met V opnieuw. Zie README "YouTube-subscriptions & video".
+        """
+        # Al draait er een video-mpv → dichtgooien.
+        if self._video_proc is not None:
+            try:
+                self._video_proc.terminate()
+                try:
+                    await asyncio.wait_for(self._video_proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    self._video_proc.kill()
+            except ProcessLookupError:
+                pass
+            self._video_proc = None
+            self.notify("Video gesloten")
+            return
+
+        # Geen video-proc → spawnen voor de huidige YouTube-track.
+        track = self.orchestrator.state.track
+        if track is None or track.source != "youtube":
+            self.notify("Video: alleen voor YouTube-tracks (speel er eerst een)",
+                        severity="warning")
+            return
+        # Argumenten: zelfde ytdl-opties als de audio-mpv, maar nu mét video
+        # in een apart Wayland-window (`--vo=gpu --force-window`). Belangrijk:
+        # `--ytdl-format=best` (een GEcombineerde video+audio stream), NIET
+        # bestaudio (audio-only → leeg venster) en NIET bestvideo+bestaudio
+        # (twee DASH-streams die mpv moet muxen — faalt regelmatig). `best`
+        # levert één bestand met beeld+geluid, tot 1080p. Geen IPC, geen idle:
+        # één-shot, stopt als de track/stream eindigt.
+        args: list[str] = [
+            "mpv",
+            "--no-terminal",
+            "--vo=gpu",
+            "--force-window",
+            "--ytdl=yes",
+            "--ytdl-format=best",
+            track.uri,
+        ]
+        log.info("V-toets: video-mpv start voor %s", track.uri)
+        try:
+            self._video_proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            self.notify("mpv niet gevonden — kan video niet openen", severity="error")
+            self._video_proc = None
+            return
+        self.notify(f"▶ video: {track.title}")
+
+    def action_tab(self, name: str) -> None:
+        """Wissel naar een top-level tabblad op naam (``search``/``queue``/``library``).
+        Gekoppeld aan de toetsen ``1/2/3``."""
+        self.query_one("#tabs", TabbedContent).active = f"tab-{name}"
