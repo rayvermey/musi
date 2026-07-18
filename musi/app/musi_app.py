@@ -149,10 +149,18 @@ class NowPlaying(Static):
         self._art_path = None
         self._sixel_supported = sixel_supported
 
-    def _text_render(self) -> str:
-        """Fallback-render wanneer geen sixel of geen art-path: twee regels,
-        metadata boven, progress-bar onder. Breedte onafhankelijk van de
-        terminal-capability — werkt overal."""
+    def render(self):
+        # Sixel-render via textual_image (pixel-perfect, foot/kitty/wezterm).
+        # We checken de flag die MusiApp.on_mount zette — query_terminal_support
+        # kan niet vanuit render() want Textual heeft geen stdin om de response
+        # op te vangen. Fallback bij geen sixel-support: tekst-versie met progress-bar.
+        if self._art_path is not None and self._sixel_supported:
+            try:
+                from textual_image.renderable.sixel import Image as SixelImage
+                return SixelImage(self._art_path)
+            except Exception as e:
+                log.warning("sixel-render mislukt voor %s: %s", self._art_path, e)
+                # val door naar tekst-versie
         title = self.track.title if self.track else "—"
         artist = self.track.artist if self.track and self.track.artist else ""
         badge = _badge_for(self.track)
@@ -195,26 +203,6 @@ class NowPlaying(Static):
                     self._art_path = fetch(state.track, self._art_dir)
                 except Exception:
                     self._art_path = None
-            self._refresh_visual()
-
-    def _refresh_visual(self) -> None:
-        """Update de Static-widget met de juiste visual: SixelImage als de
-        terminal sixel kan en er een art-path is, anders de tekst-versie.
-
-        Textual 8.x: Static.render() wordt NIET aangeroepen door de pipeline
-        — de pipeline gebruikt ``self.visual``, een cached Visual die wordt
-        gezet door ``update()``. Daarom roepen we ``self.update(...)`` aan
-        in plaats van enkel ``render()`` te overriden.
-        """
-        if self._art_path is not None and self._sixel_supported:
-            try:
-                from textual_image.renderable.sixel import Image as SixelImage
-                self.update(SixelImage(self._art_path))
-                return
-            except Exception as e:
-                log.warning("sixel-render mislukt voor %s: %s", self._art_path, e)
-                # val door naar tekst-versie
-        self.update(self._text_render())
 
 
 class SearchPane(Vertical):
