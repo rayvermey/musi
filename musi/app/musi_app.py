@@ -200,15 +200,16 @@ class FloatingCover(Static):
     DEFAULT_CSS = """
     FloatingCover {
         dock: top;
-        width: auto;
-        height: auto;
         layer: "floating";
         background: transparent;
         overflow: hidden;
+        width: auto;
+        height: auto;
     }
     FloatingCover SixelWidget {
-        width: 20;
-        height: 20;
+        max-width: 20;
+        max-height: 20;
+        align: right top;
     }
     """
 
@@ -220,7 +221,7 @@ class FloatingCover(Static):
         self._cover: SixelWidget | None = None
 
     def compose(self):
-        self._cover = SixelWidget(width=20, height=20)
+        self._cover = SixelWidget()
         yield self._cover
 
     def update_from_state(self, state) -> None:
