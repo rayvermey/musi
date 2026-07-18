@@ -73,6 +73,14 @@ from ..models import Track
 from ..orchestrator import Orchestrator, PlaybackEvent
 from ..rip import Ripper, video_id
 from ..services import Services
+
+# textual_image.renderable.Image kiest z'n backend (sixel/tgp/halfblock/unicode)
+# op basis van ``sys.__stdout__.isatty()`` bij MODULE-IMPORT. Textual vervangt
+# ``sys.__stdout__`` met een niet-TTY stream, waardoor de conditie altijd
+# False is en we de halfblock/unicode-variant krijgen — geen zes-hes.
+# Direct de SixelRenderable importeren omzeilt die check en forceert zes-data
+# (foot/kitty/wezterm ondersteunen 't; xterm zonder vt340 geeft een lege render).
+from textual_image.renderable.sixel import Image as SixelRenderable  # noqa: E402
 from .. import art as art_mod
 from ..modals import ConfirmModal, EditTagsModal, PlaylistNameModal, PlaylistPickerModal
 
@@ -149,11 +157,13 @@ class NowPlaying(Static):
         self._art_path = None
 
     def render(self):
-        # Probeer textual_image-SixelRenderable wanneer de terminal sixel ondersteunt.
+        # Probeer zes-render via SixelRenderable. Module-level import (zie top
+        # van dit bestand) omzeilt textual_image's auto-backend-keuze op
+        # sys.__stdout__.isatty() — die geeft in Textual-context altijd False
+        # en valt terug op halfblock/unicode (blokjes-art, niet zes).
         if self._art_path is not None:
             try:
-                from textual_image.renderable import Image as TexRenderable  # type: ignore
-                return TexRenderable(self._art_path)
+                return SixelRenderable(self._art_path)
             except Exception:
                 pass
         title = self.track.title if self.track else "—"
