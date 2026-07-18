@@ -142,25 +142,20 @@ class NowPlaying(Static):
     status_text: reactive[str] = reactive("gestopt")
     track: Track | None = None
 
-    def __init__(self, art_dir, sixel_supported: bool = False, **kw):
+    def __init__(self, art_dir, **kw):
         super().__init__(**kw)
         self._art_dir = art_dir
         self._last_track_id = None
         self._art_path = None
-        self._sixel_supported = sixel_supported
 
     def render(self):
-        # Sixel-render via textual_image (pixel-perfect, foot/kitty/wezterm).
-        # We checken de flag die MusiApp.on_mount zette — query_terminal_support
-        # kan niet vanuit render() want Textual heeft geen stdin om de response
-        # op te vangen. Fallback bij geen sixel-support: tekst-versie met progress-bar.
-        if self._art_path is not None and self._sixel_supported:
+        # Probeer textual_image-SixelRenderable wanneer de terminal sixel ondersteunt.
+        if self._art_path is not None:
             try:
-                from textual_image.renderable.sixel import Image as SixelImage
-                return SixelImage(self._art_path)
-            except Exception as e:
-                log.warning("sixel-render mislukt voor %s: %s", self._art_path, e)
-                # val door naar tekst-versie
+                from textual_image.renderable import Image as TexRenderable  # type: ignore
+                return TexRenderable(self._art_path)
+            except Exception:
+                pass
         title = self.track.title if self.track else "—"
         artist = self.track.artist if self.track and self.track.artist else ""
         badge = _badge_for(self.track)
@@ -2195,7 +2190,7 @@ class MusiApp(App):
         # NowPlaying eerst (dock:bottom vult van onderaf), Footer daarna — anders
         # zou Textual beide widgets op dezelfde y=laatste-rij zetten en elkaar
         # op één pixel overdekken.
-        yield NowPlaying(self.cfg.cache_dir / "art", sixel_supported=False, id="now-playing")
+        yield NowPlaying(self.cfg.cache_dir / "art", id="now-playing")
         yield Footer()
 
     # ---- acties -----------------------------------------------------
@@ -2207,17 +2202,6 @@ class MusiApp(App):
         # library-tabbladen krijgen een app-referentie (na constructie)
         lib = self.query_one(LibraryPane)
         lib._app = self
-        # Sixel-support één keer detecteren (buiten render()!) en doorgeven aan
-        # NowPlaying. query_terminal_support stuurt een escape naar de terminal
-        # en leest het antwoord — dat kan niet vanuit render() want Textual
-        # heeft geen stdin. Foot/kitty/wezterm = true; xterm zonder vt340 = false.
-        try:
-            from textual_image.renderable.sixel import query_terminal_support
-            sixel_ok = await asyncio.to_thread(query_terminal_support)
-        except Exception as e:
-            log.info("sixel-detectie faalde, fallback naar tekst-versie: %s", e)
-            sixel_ok = False
-        self.query_one("#now-playing", NowPlaying)._sixel_supported = sixel_ok
         # library vullen (async, in thread)
         asyncio.create_task(self._refresh_library())
         # Spotify-library wordt LAZY geladen bij het openen van de Spotify-tab
