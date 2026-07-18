@@ -70,23 +70,7 @@ async def _run_tui() -> int:
     if sv.spotify_engine is not None:
         engines["spotifyd"] = sv.spotify_engine
     orch = Orchestrator(engines)
-
-    # Sixel-support detecteren vóór we de TUI starten — anders zouden we het
-    # vanuit on_mount moeten doen met een await op een thread, en het resultaat
-    # zou pas zichtbaar zijn als de app al render-context heeft opgezet. Hier
-    # (in een gewone async-context) kunnen we in een aparte thread detecteren
-    # en de flag aan MusiApp meegeven zodat NowPlaying bij mount al weet wat 't
-    # moet doen. Foot/kitty/wezterm = true; xterm zonder vt340 = false.
-    sixel_supported = False
-    try:
-        from textual_image.renderable.sixel import query_terminal_support
-        sixel_supported = await asyncio.to_thread(query_terminal_support)
-        logging.info("sixel-detectie: terminal %s sixel",
-                     "ondersteunt" if sixel_supported else "ondersteunt GEEN")
-    except Exception as e:
-        logging.info("sixel-detectie faalde, fallback naar tekst-versie: %s", e)
-
-    app = MusiApp(orch, sv, cfg, sixel_supported=sixel_supported)
+    app = MusiApp(orch, sv, cfg)
 
     try:
         await orch.start()        # start mpv-subprocess + spotifyd-poll

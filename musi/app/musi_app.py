@@ -2166,13 +2166,11 @@ class MusiApp(App):
 
     results: reactive[list[Track]] = reactive(list, recompose=False)
 
-    def __init__(self, orchestrator: Orchestrator, services: Services, cfg,
-                 sixel_supported: bool = False) -> None:
+    def __init__(self, orchestrator: Orchestrator, services: Services, cfg) -> None:
         super().__init__()
         self.orchestrator = orchestrator
         self.services = services
         self.cfg = cfg
-        self._sixel_supported = sixel_supported
         # V-toets: aparte mpv-instantie als pure video-viewer (geen IPC, geen
         # orchestrator-koppeling). De hoofd-mpv speelt door — alleen deze
         # tweede mpv wordt aan/uit gezet.
@@ -2197,9 +2195,7 @@ class MusiApp(App):
         # NowPlaying eerst (dock:bottom vult van onderaf), Footer daarna — anders
         # zou Textual beide widgets op dezelfde y=laatste-rij zetten en elkaar
         # op één pixel overdekken.
-        yield NowPlaying(self.cfg.cache_dir / "art",
-                         sixel_supported=self._sixel_supported,
-                         id="now-playing")
+        yield NowPlaying(self.cfg.cache_dir / "art", sixel_supported=False, id="now-playing")
         yield Footer()
 
     # ---- acties -----------------------------------------------------
@@ -2211,6 +2207,17 @@ class MusiApp(App):
         # library-tabbladen krijgen een app-referentie (na constructie)
         lib = self.query_one(LibraryPane)
         lib._app = self
+        # Sixel-support één keer detecteren (buiten render()!) en doorgeven aan
+        # NowPlaying. query_terminal_support stuurt een escape naar de terminal
+        # en leest het antwoord — dat kan niet vanuit render() want Textual
+        # heeft geen stdin. Foot/kitty/wezterm = true; xterm zonder vt340 = false.
+        try:
+            from textual_image.renderable.sixel import query_terminal_support
+            sixel_ok = await asyncio.to_thread(query_terminal_support)
+        except Exception as e:
+            log.info("sixel-detectie faalde, fallback naar tekst-versie: %s", e)
+            sixel_ok = False
+        self.query_one("#now-playing", NowPlaying)._sixel_supported = sixel_ok
         # library vullen (async, in thread)
         asyncio.create_task(self._refresh_library())
         # Spotify-library wordt LAZY geladen bij het openen van de Spotify-tab
