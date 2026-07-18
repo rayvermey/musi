@@ -200,15 +200,14 @@ class FloatingCover(Static):
     DEFAULT_CSS = """
     FloatingCover {
         dock: top;
-        layer: "floating";
+        width: 100%;
+        layer: floating;
         background: transparent;
         overflow: hidden;
-        width: auto;
-        height: auto;
     }
     FloatingCover SixelWidget {
-        max-width: 20;
-        max-height: 20;
+        max-width: 14;
+        max-height: 14;
         align: right top;
     }
     """
@@ -227,6 +226,7 @@ class FloatingCover(Static):
     def update_from_state(self, state) -> None:
         tid = (state.track.uri if state.track else None)
         if tid != self._last_track_id:
+            log.info("FloatingCover: nieuwe track %s", tid)
             self._last_track_id = tid
             self._art_path = None
             if state.track is not None:
@@ -235,13 +235,15 @@ class FloatingCover(Static):
                     path = fetch(state.track, self._art_dir)
                     if path:
                         self._art_path = str(path)
-                except Exception:
+                        log.info("FloatingCover: art=%s", self._art_path)
+                except Exception as e:
+                    log.warning("FloatingCover art fetch: %s", e)
                     self._art_path = None
-        if self._cover is not None and self.is_mounted:
+        if self._cover is not None:
             try:
                 self._cover.image = self._art_path
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("FloatingCover image set: %s", e)
 
 
 class SearchPane(Vertical):
@@ -2365,8 +2367,11 @@ class MusiApp(App):
 
     def _on_orch_event(self, ev: PlaybackEvent) -> None:
         if ev.kind == "state" and ev.state is not None:
+            try:
+                self.query_one(FloatingCover).update_from_state(ev.state)
+            except Exception as e:
+                log.warning("FloatingCover query failed: %s", e)
             self.query_one(NowPlaying).update_from_state(ev.state)
-            self.query_one(FloatingCover).update_from_state(ev.state)
             # auto-rip: bij een YouTube-track plan een rip na de grace-periode.
             # _schedule_rip dedup't op video-id (goedkoop, want dit vuurt bij
             # elke positie-update). Spotify/lokaal worden hier stil genegeerd.
