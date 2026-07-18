@@ -48,6 +48,7 @@ import os
 import subprocess  # voor DEVNULL bij video-mpv-spawn
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -74,13 +75,13 @@ from ..orchestrator import Orchestrator, PlaybackEvent
 from ..rip import Ripper, video_id
 from ..services import Services
 
-# textual_image.renderable.Image kiest z'n backend (sixel/tgp/halfblock/unicode)
-# op basis van ``sys.__stdout__.isatty()`` bij MODULE-IMPORT. Textual vervangt
-# ``sys.__stdout__`` met een niet-TTY stream, waardoor de conditie altijd
-# False is en we de halfblock/unicode-variant krijgen — geen zes-hes.
-# Direct de SixelRenderable importeren omzeilt die check en forceert zes-data
-# (foot/kitty/wezterm ondersteunen 't; xterm zonder vt340 geeft een lege render).
-from textual_image.renderable.sixel import Image as SixelRenderable  # noqa: E402
+# textual_image.widget.SixelImage is een echte Textual-Widget die zes-data
+# rechtstreeks naar de driver stuurt. Importeren op MODULE-NIVEAU is vereist:
+# het widget doet een ``get_cell_size()``-call bij constructie om de
+# terminal's pixel-per-cel te meten, en dat moet vóór Textual de terminal
+# overneemt. ``renderable.Image`` gooit Textual's pipeline weg (printable-
+# segment violation); een Widget-widget niet.
+from textual_image.widget import SixelImage as SixelWidget  # noqa: E402
 from .. import art as art_mod
 from ..modals import ConfirmModal, EditTagsModal, PlaylistNameModal, PlaylistPickerModal
 
@@ -135,14 +136,10 @@ def _art_from_collection(coll: dict) -> str:
 
 
 class NowPlaying(Static):
-    """Footer-balk met albumhoes (sixel/halfblock via textual-image) + titel/
-    artiest + positie/duur + bron-badge.
-
+    """Footer-balk met titel/artiest + positie/duur + bron-badge + progress-bar.
     Update-reactives (``progress``/``duration``/``status_text``) houden de
-    weergave live sync zonder handmatig refreshen. Bij een nieuwe track
-    (gedetecteerd via uri-wissel) cache-bust'en we de hoes en proberen we een
-    nieuwe op te halen (``art.fetch``). De hoes wordt pas getoond als 'm er één
-    is; anders valt de balk terug op tekst.
+    weergave live sync. Bij een nieuwe track (uri-wissel) cache-bust'en we
+    de albumhoes en proberen een nieuwe op te halen (``art.fetch``).
     """
 
     progress: reactive[float] = reactive(0.0)
@@ -157,23 +154,11 @@ class NowPlaying(Static):
         self._art_path = None
 
     def render(self):
-        # Probeer zes-render via SixelRenderable. Module-level import (zie top
-        # van dit bestand) omzeilt textual_image's auto-backend-keuze op
-        # sys.__stdout__.isatty() — die geeft in Textual-context altijd False
-        # en valt terug op halfblock/unicode (blokjes-art, niet zes).
-        if self._art_path is not None:
-            try:
-                return SixelRenderable(self._art_path)
-            except Exception:
-                pass
         title = self.track.title if self.track else "—"
         artist = self.track.artist if self.track and self.track.artist else ""
         badge = _badge_for(self.track)
         dur = _fmt_duration(self.duration)
         pos = _fmt_duration(self.progress)
-        # Progress-bar onder de tekst — visueel duidelijk hoever de speler is.
-        # We gebruiken een blokjes-glyph (█/░) zodat het in elke terminal werkt
-        # (geen sixel/halfblock nodig). Width = 30 vakjes = redelijk detail.
         bar_w = 30
         if self.duration > 0:
             filled = max(0, min(bar_w, round(self.progress / self.duration * bar_w)))
@@ -182,8 +167,6 @@ class NowPlaying(Static):
             bar = "░" * bar_w
         left = f"{badge} {title}" + (f"  —  {artist}" if artist else "")
         right = f"{pos} / {dur}   {self.status_text}"
-        # Twee regels: bovenste = metadata, onderste = progress-bar.
-        # We krijgen 3 rijen van CSS (height:3) — laat de bovenste 2 gevuld.
         line1 = f"{left}    [{right}]"
         line2 = f"{bar}"
         return f"{line1}\n{line2}"
@@ -197,7 +180,6 @@ class NowPlaying(Static):
             "paused": "❙❙ pauze",
             "stopped": "□ gestopt",
         }.get(state.status.value, state.status.value)
-        # nieuwe track? cache-bust: probeer een nieuwe albumhoes
         tid = (state.track.uri if state.track else None)
         if tid != self._last_track_id:
             self._last_track_id = tid
@@ -208,6 +190,57 @@ class NowPlaying(Static):
                     self._art_path = fetch(state.track, self._art_dir)
                 except Exception:
                     self._art_path = None
+
+
+class FloatingCover(Static):
+    """Zwevend albumhoes-widget: sixel-rendered album art rechtsboven,
+    bovenop de rest van de layout. ``update_from_state`` toont de hoes
+    van de huidige track en wist 'm als er geen is."""
+
+    DEFAULT_CSS = """
+    FloatingCover {
+        dock: top;
+        width: auto;
+        height: auto;
+        layer: "floating";
+        background: transparent;
+        overflow: hidden;
+    }
+    FloatingCover SixelWidget {
+        width: 20;
+        height: 20;
+    }
+    """
+
+    def __init__(self, art_dir, **kw):
+        super().__init__(**kw)
+        self._art_dir = Path(art_dir)
+        self._last_track_id: str | None = None
+        self._art_path: str | None = None
+        self._cover: SixelWidget | None = None
+
+    def compose(self):
+        self._cover = SixelWidget(width=20, height=20)
+        yield self._cover
+
+    def update_from_state(self, state) -> None:
+        tid = (state.track.uri if state.track else None)
+        if tid != self._last_track_id:
+            self._last_track_id = tid
+            self._art_path = None
+            if state.track is not None:
+                try:
+                    from ..art import fetch
+                    path = fetch(state.track, self._art_dir)
+                    if path:
+                        self._art_path = str(path)
+                except Exception:
+                    self._art_path = None
+        if self._cover is not None and self.is_mounted:
+            try:
+                self._cover.image = self._art_path
+            except Exception:
+                pass
 
 
 class SearchPane(Vertical):
@@ -2148,7 +2181,7 @@ class MusiApp(App):
     """
 
     CSS = """
-    Screen { layout: vertical; }
+    Screen { layout: vertical; layers: floating above; }
     #main { height: 1fr; }
     NowPlaying { dock: bottom; height: 3; padding: 0 1; background: $boost; }
     SearchPane, QueuePane, LibraryPane { height: 1fr; }
@@ -2189,6 +2222,9 @@ class MusiApp(App):
         self._rip_done: set[str] = set()      # video-ids die deze sessie klaar zijn
 
     def compose(self) -> ComposeResult:
+        # Albumhoes-overlay (rechtsboven) — dit widget zit op de "floating" layer
+        # zodat het boven alles rendered, ongeacht de layout-volgorde.
+        yield FloatingCover(self.cfg.cache_dir / "art", id="floating-cover")
         yield Header(show_clock=False)
         with TabbedContent(id="tabs", initial="tab-search"):
             with TabPane("Zoeken", id="tab-search"):
@@ -2329,6 +2365,7 @@ class MusiApp(App):
     def _on_orch_event(self, ev: PlaybackEvent) -> None:
         if ev.kind == "state" and ev.state is not None:
             self.query_one(NowPlaying).update_from_state(ev.state)
+            self.query_one(FloatingCover).update_from_state(ev.state)
             # auto-rip: bij een YouTube-track plan een rip na de grace-periode.
             # _schedule_rip dedup't op video-id (goedkoop, want dit vuurt bij
             # elke positie-update). Spotify/lokaal worden hier stil genegeerd.
