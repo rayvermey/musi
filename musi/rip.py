@@ -218,6 +218,7 @@ class Ripper:
         ]
         if self._cookies:
             args += ["--cookies-from-browser", self._cookies]
+        args += ["--js-runtimes", "node:/usr/bin/node", "--remote-components", "ejs:npm"]
 
         log.info("rip start: %s — %s", vid, url)
         async with self._staging_sem():
