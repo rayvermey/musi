@@ -37,6 +37,23 @@ log = logging.getLogger(__name__)
 
 SEARCH_TIMEOUT = 45.0  # seconden — yt-dlp kan traag zijn bij grootte feeds
 
+
+class YouTubeFeedUnavailable(RuntimeError):
+    """YouTube weigert deze specifieke feed (FL/WL/HL-stijl).
+
+    YouTube serveert de virtual system-playlists (``?list=FL`` voor Favorieten,
+    ``?list=WL`` voor Watch Later, ``?list=HL`` voor History) niet meer als
+    externe feed — dat is een YouTube-side beslissing, geen cookie-probleem.
+    We laten 't expliciet falen zodat de UI een eerlijke melding kan tonen
+    ("YouTube serveert deze virtual playlist niet meer") i.p.v. de generieke
+    "0 resultaten — ben je ingelogd?"-hint.
+
+    ``kind`` is ``"unviewable"`` (WL/HL) of ``"bad_request"`` (FL).
+    """
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
 # Non-flat ("date"-sort) heeft een eigen, veel ruimere time-out: yt-dlp moet
 # elke video-pagina resolv'en voor z'n upload-datum, wat ~1-3s/video kost.
 # Voor 20 video's ~30-60s; 180s is de veilige bovengrens.
@@ -184,6 +201,31 @@ class YouTubeSearch(SearchProvider):
                                key=_entry_upload_ts, reverse=True)[:limit]
         return self._feed_to_tracks({"entries": dated_entries})
 
+    def _check_feed_error(self, data: dict, label: str) -> None:
+        """Raise ``YouTubeFeedUnavailable`` als ``_run_yt_dlp`` een getagd
+        virtual-playlist-failure achterliet. Anders stilletjes door (lege
+        lijst = "geen video's gevonden", wat voor echte subscriptions-feed
+        een werkbaar resultaat is).
+
+        Geeft de UI genoeg detail om een eerlijke foutmelding te tonen
+        ("YouTube serveert 'Favorieten' niet meer als virtual playlist")
+        i.p.v. de misleidende "Ingelogd in je browser?"-hint.
+        """
+        err = data.get("_yt_error")
+        if not err:
+            return
+        if err == "bad_request":
+            raise YouTubeFeedUnavailable(
+                "bad_request",
+                f"YouTube weigerde {label} (HTTP 400) — "
+                f"virtual playlist wordt niet meer geserveerd")
+        if err == "unviewable":
+            raise YouTubeFeedUnavailable(
+                "unviewable",
+                f"YouTube gaf '{label}' als unviewable — "
+                f"virtual playlist wordt niet meer geserveerd")
+        # Onbekende tag: laat 't op de generieke manier falen via {}.
+
     async def subscriptions(self, limit: int = 100) -> list[Track]:
         """Recente uploads uit je YouTube-subscriptions. **Vereist cookies** —
         zonder login levert de feed een lege lijst."""
@@ -191,32 +233,43 @@ class YouTubeSearch(SearchProvider):
             ["https://www.youtube.com/feed/subscriptions"],
             extra_args=["--playlist-items", f"1:{limit}"],
         )
+        self._check_feed_error(data, "Subscriptions")
         return self._feed_to_tracks(data, playlist_id="subscriptions")
 
     async def favorites(self, limit: int = 100) -> list[Track]:
-        """Eigen 'Favorieten' playlist (``?list=FL``). **Vereist cookies.**"""
+        """Eigen 'Favorieten' playlist (``?list=FL``). **Vereist cookies.**
+
+        Sinds 2024 weigert YouTube ``?list=FL`` met HTTP 400 — de virtual
+        Favorieten-playlist wordt niet meer geserveerd aan externe clients.
+        We raisen dan ``YouTubeFeedUnavailable("bad_request", …)`` zodat de
+        UI dat netjes kan tonen."""
         data = await self._run_yt_dlp(
             ["https://www.youtube.com/playlist?list=FL"],
             extra_args=["--playlist-items", f"1:{limit}"],
         )
+        self._check_feed_error(data, "Favorieten")
         return self._feed_to_tracks(data, playlist_id="FL")
 
     async def watch_later(self, limit: int = 100) -> list[Track]:
-        """Eigen 'Watch Later' playlist (``?list=WL``). **Vereist cookies.**"""
+        """Eigen 'Watch Later' playlist (``?list=WL``). **Vereist cookies.**
+
+        YouTube classificeert deze als ``"unviewable"`` voor externe clients;
+        we raisen ``YouTubeFeedUnavailable("unviewable", …)``."""
         data = await self._run_yt_dlp(
             ["https://www.youtube.com/playlist?list=WL"],
             extra_args=["--playlist-items", f"1:{limit}"],
         )
+        self._check_feed_error(data, "Watch Later")
         return self._feed_to_tracks(data, playlist_id="WL")
 
     async def history(self, limit: int = 50) -> list[Track]:
         """Eigen 'History' (recent bekeken, ``?list=HL``). **Vereist cookies.**
-        Let op: YouTube kan deze playlist als 'unviewable' classificeren —
-        retourneert dan (netjes) een lege lijst."""
+        YouTube geeft deze meestal als 'unviewable' terug (zie watch_later)."""
         data = await self._run_yt_dlp(
             ["https://www.youtube.com/playlist?list=HL"],
             extra_args=["--playlist-items", f"1:{limit}"],
         )
+        self._check_feed_error(data, "History")
         return self._feed_to_tracks(data, playlist_id="HL")
 
     async def channel(self, channel_id_or_url: str, limit: int = 50) -> list[Track]:
@@ -247,8 +300,17 @@ class YouTubeSearch(SearchProvider):
         """Standaard yt-dlp-args voor zoek + feed-fetches: ``flat=True`` geeft
         watch-URLs terug zonder resolv'en (snel, geen upload-datum per entry);
         ``flat=False`` resolved elke video (~1-3s/video) zodat ``timestamp``
-        beschikbaar komt — gebruikt voor ``sort="date"``. Cookies-flag erbij
-        als ``cookies_from_browser`` gezet is."""
+        beschikbaar komt — gebruikt voor ``sort="date"``.
+
+        Cookies-flag erbij als ``cookies_from_browser`` gezet is. Bij cookies
+        hangen we ook ``--extractor-args youtubetab:skip=authcheck`` aan: de
+        ``youtube:tab``-extractor waarschuwt "may not extract correctly without
+        a successful webpage download" zodra 'ie ingelogde playlists ziet, en
+        zonder die flag behandelt 'ie de waarschuwing als fataal (exit 1, stdout
+        ``null``) óók als de cookies prima werken — dat is precies wat maakt
+        dat subscriptions/Favorites leeg lijken terwijl je wél ingelogd bent.
+        Met ``skip=authcheck`` gaat 'm door en gebruikt 'ie de cookies die 'ie
+        net zélf uit de browser las."""
         args: list[str] = [
             self._bin,
             "--no-warnings",
@@ -261,6 +323,10 @@ class YouTubeSearch(SearchProvider):
             # yt-dlp leest YouTube-cookies direct uit de browser; geen
             # plaintext cookies in eigen files.
             args.extend(["--cookies-from-browser", self._cookies_from_browser])
+            # Sla de auth-check over — anders weigert yt-dlp de hele feed
+            # bij ingelogde playlists (subscriptions/Favorites) terwijl de
+            # cookies gewoon werken.
+            args.extend(["--extractor-args", "youtubetab:skip=authcheck"])
         args.extend(extra)
         return args
 
@@ -284,6 +350,16 @@ class YouTubeSearch(SearchProvider):
                 aan ``_yt_dlp_args`` — een verdwaalde call zónder maakt dat de
                 per-video datum-fetch hieronder stiekem wél flat blijft (geen
                 upload-datum/views/likes).
+
+        Speciale gevallen (terug in ``data`` zodat de UI ze kan onderscheiden
+        van "geen resultaat"):
+
+        * ``{"_yt_error": "unviewable"}`` — YouTube zegt dat dit type playlist
+          (bv ``?list=WL``/``?list=HL``) niet meer als virtual playlist
+          opvraagbaar is; gebruiker moet z'n eigen playlist-URL gebruiken.
+        * ``{"_yt_error": "bad_request"}`` — YouTube weigerde de aanroep met
+          HTTP 400 (bv ``?list=FL`` sinds 2024).
+        * Anders ``{}`` bij falen (lege lijst, UI toont generieke melding).
         """
         cmd = self._yt_dlp_args(urls + list(extra_args), flat=flat)
         proc = await asyncio.create_subprocess_exec(
@@ -300,11 +376,30 @@ class YouTubeSearch(SearchProvider):
             log.warning("yt-dlp time-out voor %s", urls)
             return {}
         if proc.returncode != 0:
-            err = stderr.decode(errors="replace")[:300]
-            log.warning("yt-dlp exit %s: %s", proc.returncode, err)
+            err = stderr.decode(errors="replace")
+            log.warning("yt-dlp exit %s voor %s: %s",
+                        proc.returncode, urls, err[:300])
+            # Onderscheid virtual-playlist-failures (YouTube-side) van
+            # generieke fouten — anders bagatelliseren we een echte 400 tot
+            # "0 resultaten, ben je ingelogd?".
+            if "This playlist type is unviewable" in err:
+                return {"_yt_error": "unviewable"}
+            if "HTTP Error 400" in err or "Bad Request" in err:
+                return {"_yt_error": "bad_request"}
+            return {}
+        # sitecustomize.py (in deze venv) print ``SITECUSTOMIZE_LOADED`` /
+        # ``SILENCED_DASBUS`` op stdout vóór het échte script-output. Omdat
+        # ``yt-dlp`` ook in deze venv draait, krijgt élke yt-dlp-aanroep die
+        # prefix. We skippen niet-JSON-voorvoegsel door pas vanaf de eerste
+        # ``{`` te parsen — robuust tegen willekeurige pre-output en blijft
+        # werken als sitecustomize later wegvalt.
+        raw = stdout.decode(errors="replace")
+        start = raw.find("{")
+        if start < 0:
+            log.warning("yt-dlp gaf geen JSON terug voor %s", urls)
             return {}
         try:
-            return json.loads(stdout.decode())
+            return json.loads(raw[start:])
         except json.JSONDecodeError:
             log.warning("yt-dlp gaf geen geldige JSON terug voor %s", urls)
             return {}
