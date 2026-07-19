@@ -135,11 +135,101 @@ def _art_from_collection(coll: dict) -> str:
     return ""
 
 
-class NowPlaying(Static):
-    """Footer-balk met titel/artiest + positie/duur + bron-badge + progress-bar.
-    Update-reactives (``progress``/``duration``/``status_text``) houden de
-    weergave live sync. Bij een nieuwe track (uri-wissel) cache-bust'en we
-    de albumhoes en proberen een nieuwe op te halen (``art.fetch``).
+class FloatingCover(Horizontal):
+    """Albumhoes via sixel, rechtsboven op de floating layer.
+
+    Alleen de zesel-widget (geen tekst). Via een reactive _track_id met watcher
+    wordt de hoes ALLEEN bij track-wissel gezet — niet bij elke positie-update.
+    Dat voorkomt herhaalde refresh(layout=True) die anders het scherm zou scrollen.
+    """
+
+    DEFAULT_CSS = """
+    FloatingCover {
+        position: absolute;
+        layer: floating;
+        width: 14;
+        height: 7;
+        background: $boost;
+    }
+    FloatingCover #cover-art {
+        width: 14;
+        height: 7;
+    }
+    """
+
+    _track_id: reactive[str | None] = reactive(None)
+    _offset_x: reactive[int] = reactive(0)
+    _offset_y: reactive[int] = reactive(0)
+
+    def __init__(self, art_dir, **kw):
+        super().__init__(**kw)
+        self._art_dir = art_dir
+        self._cover = SixelWidget(None, id="cover-art")
+
+    def on_mount(self) -> None:
+        self.mount(self._cover)
+        self._place_top_right()
+
+    def _place_top_right(self) -> None:
+        try:
+            screen_w = self.app.size.width
+        except Exception:
+            screen_w = 80
+        self._offset_x = max(0, screen_w - 14)
+        self._offset_y = 0
+        self._apply_offset()
+
+    def _apply_offset(self) -> None:
+        self.styles.offset = (self._offset_x, self._offset_y)
+        self.refresh()
+
+    def move(self, dx: int, dy: int) -> None:
+        try:
+            sw, sh = self.app.size.width, self.app.size.height
+        except Exception:
+            sw, sh = 80, 24
+        new_x = max(0, min(max(0, sw - 14), self._offset_x + dx))
+        new_y = max(0, min(max(0, sh - 7), self._offset_y + dy))
+        if new_x == self._offset_x and new_y == self._offset_y:
+            return
+        self._offset_x = new_x
+        self._offset_y = new_y
+        self._apply_offset()
+
+    def reset_position(self) -> None:
+        self._place_top_right()
+
+    def watch__track_id(self, tid: str | None) -> None:
+        if tid is None:
+            self._cover.image = None
+            return
+        try:
+            from ..art import fetch
+            path = fetch(self._track_object, self._art_dir)
+        except Exception:
+            path = None
+        self._cover.image = path
+
+    def update_from_state(self, state) -> None:
+        self._track_object = state.track
+        self._track_id = state.track.uri if state.track else None
+
+
+class NowPlaying(Horizontal):
+    """Footer-balk: titel/artiest/progress."""
+
+    DEFAULT_CSS = """
+    NowPlaying {
+        dock: bottom;
+        height: 3;
+        padding: 0 1;
+        background: $boost;
+    }
+    NowPlaying #now-playing-text {
+        width: 1fr;
+        height: 3;
+        padding: 0 1;
+    }
     """
 
     progress: reactive[float] = reactive(0.0)
@@ -147,13 +237,14 @@ class NowPlaying(Static):
     status_text: reactive[str] = reactive("gestopt")
     track: Track | None = None
 
-    def __init__(self, art_dir, **kw):
+    def __init__(self, **kw):
         super().__init__(**kw)
-        self._art_dir = art_dir
-        self._last_track_id = None
-        self._art_path = None
+        self._text = Static(id="now-playing-text")
 
-    def render(self):
+    def on_mount(self) -> None:
+        self.mount(self._text)
+
+    def _render_text(self) -> str:
         title = self.track.title if self.track else "—"
         artist = self.track.artist if self.track and self.track.artist else ""
         badge = _badge_for(self.track)
@@ -180,73 +271,50 @@ class NowPlaying(Static):
             "paused": "❙❙ pauze",
             "stopped": "□ gestopt",
         }.get(state.status.value, state.status.value)
-        tid = (state.track.uri if state.track else None)
-        if tid != self._last_track_id:
-            self._last_track_id = tid
-            self._art_path = None
-            if state.track is not None:
-                try:
-                    from ..art import fetch
-                    self._art_path = fetch(state.track, self._art_dir)
-                except Exception:
-                    self._art_path = None
+        self._text.update(self._render_text())
 
 
-class FloatingCover(Static):
-    """Zwevend albumhoes-widget: sixel-rendered album art rechtsboven,
-    bovenop de rest van de layout. ``update_from_state`` toont de hoes
-    van de huidige track en wist 'm als er geen is."""
+class _DoubleClickPlay:
+    """Mixin: dubbelklik op een DataTable-rij = zelfde als Enter.
 
-    DEFAULT_CSS = """
-    FloatingCover {
-        dock: top;
-        width: 100%;
-        layer: floating;
-        background: transparent;
-        overflow: hidden;
-    }
-    FloatingCover SixelWidget {
-        max-width: 14;
-        max-height: 14;
-        align: right top;
-    }
+    In ``_patch_dt_click`` patchen we ``DataTable._on_click`` om dubbelklik
+    te detecteren (``event.chain >= 2``). ``on_mount`` roept dit voor alle
+    kind-DataTables. Voor lazy-mounted tabellen (Spotify) roept
+    ``on_tabbed_content_tab_activated`` het ook aan.
     """
 
-    def __init__(self, art_dir, **kw):
-        super().__init__(**kw)
-        self._art_dir = Path(art_dir)
-        self._last_track_id: str | None = None
-        self._art_path: str | None = None
-        self._cover: SixelWidget | None = None
+    def _patch_dt_click(self, tbl: DataTable) -> None:
+        """Patch ``DataTable._on_click`` zodat dubbelklik action_play_now triggert.
 
-    def compose(self):
-        self._cover = SixelWidget()
-        yield self._cover
+        Textual's dispatch zoekt de handler in de CLASS __dict__ (via
+        ``_get_dispatch_methods``). Instance-attributen worden NIET geraadpleegd,
+        dus een instance-patch (``tbl._on_click = ...``) heeft geen effect.
+        We patchen daarom de CLASS-methode ``DataTable._on_click`` zelf.
 
-    def update_from_state(self, state) -> None:
-        tid = (state.track.uri if state.track else None)
-        if tid != self._last_track_id:
-            log.info("FloatingCover: nieuwe track %s", tid)
-            self._last_track_id = tid
-            self._art_path = None
-            if state.track is not None:
-                try:
-                    from ..art import fetch
-                    path = fetch(state.track, self._art_dir)
-                    if path:
-                        self._art_path = str(path)
-                        log.info("FloatingCover: art=%s", self._art_path)
-                except Exception as e:
-                    log.warning("FloatingCover art fetch: %s", e)
-                    self._art_path = None
-        if self._cover is not None:
-            try:
-                self._cover.image = self._art_path
-            except Exception as e:
-                log.warning("FloatingCover image set: %s", e)
+        ``patched`` is een ``async def`` die via ``__get__`` automatisch
+        ``self`` meekrijgt als DataTable-instance. De cursor wordt
+        meeverplaatst door de originele ``_on_click`` aan te roepen; voor
+        dubbelklik (``chain >= 2``) wordt eerst ``action_play_now(self)``
+        aangeroepen met de aangeklikte tabel — zo hoeft de handler niet te
+        raden welke tabel focus heeft.
+        """
+        from textual.widgets import DataTable as DT
+
+        if not hasattr(DT, "_musi_original_on_click"):
+            DT._musi_original_on_click = DT._on_click
+
+        pane = self  # capture: de pane (SearchPane / LibraryPane / QueuePane)
+
+        async def patched(self, event) -> None:  # type: ignore[override]
+            if getattr(event, "chain", 1) >= 2:
+                await pane.action_play_now(self)
+            await DT._musi_original_on_click(self, event)
+
+        # Patch de CLASS-methode zodat Textual's dispatch 'm vindt.
+        DT._on_click = patched
 
 
-class SearchPane(Vertical):
+class SearchPane(Vertical, _DoubleClickPlay):
     """Zoektab: een Input + een resultaten-DataTable (+ bron-label).
 
     De Input accepteert een optionele **bron-prefix** om per-bron te zoeken:
@@ -289,6 +357,7 @@ class SearchPane(Vertical):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#results-table", DataTable)
+        self._patch_dt_click(tbl)
         self._setup_columns(show_stats=False)
         self._cols_now = list(self._COLS_PLAIN)
 
@@ -521,13 +590,9 @@ class SearchPane(Vertical):
                     key=f"i:{i}",
                 )
 
-    async def action_play_now(self) -> None:
-        # priority=True op deze Enter-binding onderschept Enter óók als de
-        # zoek-Input focus heeft — Input.Submitted wordt daarmee geblokkeerd
-        # (priority-binding wordt vóór de focused widget's bindings gecheckt).
-        # Fix: als de Input focus heeft, doe de zoekactie direct (en sla de
-        # Input.Submitted-bubbling over, die in deze Textual-versie niet
-        # betrouwbaar bij de parent aankomt).
+    async def action_play_now(self, tbl: DataTable | None = None) -> None:
+        # tbl is de aangeklikte tabel (via dubbelklik-patch). Priority-binding
+        # Enter wordt hier ook nog steeds opgevangen — tbl is dan None.
         si = self.query_one("#search-input", Input)
         if si.has_focus:
             await self._app._on_search_submit(si.value)
@@ -638,12 +703,16 @@ class SearchPane(Vertical):
             return None
 
 
-class QueuePane(Vertical):
+class QueuePane(Vertical, _DoubleClickPlay):
     """Queue-tab: één DataTable met de orchestrator-queue. De actieve track
     krijgt een ``▶``-markering. ``render_queue`` wordt aangeroepen vanuit de App
     bij elk queue-event."""
 
     BINDINGS = [
+        # priority=True: wordt gecheckt vóór de DataTable's eigen Enter-binding
+        # ("Select cells under the cursor"). Zonder priority eet de DataTable
+        # Enter op en komt play_now nooit aan.
+        Binding("enter", "play_now", "Speel", priority=True),
         # Spotify-save: opent de PlaylistPickerModal (Liked Songs / eigen
         # playlist / nieuwe playlist). Werkt op de queue-rij.
         Binding("s", "save_to_playlist", "Opslaan"),
@@ -659,6 +728,17 @@ class QueuePane(Vertical):
     def on_mount(self) -> None:
         tbl = self.query_one("#queue-table", DataTable)
         tbl.add_columns("♪", "Titel", "Artiest", "Duur")
+        self._patch_dt_click(tbl)
+
+    async def action_play_now(self, tbl: DataTable | None = None) -> None:
+        """Enter/dubbelklik op een queue-rij: speel de geselecteerde track vanaf
+        daar. De rest van de queue (tracks ná deze) blijft staan; alleen
+        ``queue.index`` verplaatst. De cursor in de tabel wordt door Enter
+        sowieso al verzet (DataTable default)."""
+        i = self._selected_index()
+        if i is None:
+            return
+        await self._app.orchestrator.play_index(i)
 
     def render_queue(self, queue) -> None:
         tbl = self.query_one("#queue-table", DataTable)
@@ -699,7 +779,7 @@ class QueuePane(Vertical):
         self._app.open_save_picker([track.uri], track.title)
 
 
-class LibraryPane(Vertical):
+class LibraryPane(Vertical, _DoubleClickPlay):
     """Library-tabbladen: Lokaal (met subtabs Nummers/Mappen/Albums/Artiesten/Genre),
     YouTube (Subscriptions/Favorieten/Watch Later/History) en Spotify
     (Liked Songs + albums/playlists-drill-down).
@@ -876,6 +956,13 @@ class LibraryPane(Vertical):
             if not self._spotify_loaded:
                 self._spotify_loaded = True
                 asyncio.create_task(self.refresh_spotify(self._app))
+            # Dubbelklik-patch op de Spotify DataTables (lazy-mounted)
+            for tbl_id in ("#lib-spotify-meta", "#lib-detail-table"):
+                try:
+                    tbl = self.query_one(tbl_id, DataTable)
+                    self._patch_dt_click(tbl)
+                except Exception:
+                    pass
             self.query_one("#lib-spotify-meta", DataTable).focus()
         elif pid == "ll-folders":
             if not self._folder_loaded:
@@ -997,6 +1084,9 @@ class LibraryPane(Vertical):
                     yield DataTable(id="lib-yt-detail", cursor_type="row")
 
     def on_mount(self) -> None:
+        # Dubbelklik-patch op alle DataTables in de Library-pane
+        for tbl in self.query(DataTable):
+            self._patch_dt_click(tbl)
         self.query_one("#lib-local-table", DataTable).add_columns("♪", "Titel", "Artiest", "Album", "Duur")
         # Lokaal-subtabs (Mappen / Albums / Artiesten / Genre)
         self.query_one("#lib-folders-table", DataTable).add_columns("Naam", "Type", "#")
@@ -1079,20 +1169,26 @@ class LibraryPane(Vertical):
             f"Playlists: {len(playlists)}  —  Enter op een album/playlist opent 'm"
         )
 
-    async def action_play_now(self) -> None:
-        # Enter is contextbewust op basis van FOCUS — eerst leaf/detail (speel
-        # één track), daarna meta/folder (drill of daal af).
-        local = self.query_one("#lib-local-table", DataTable)
-        if local.has_focus:
-            idx = self._row_index(local, "l:")
+    async def action_play_now(self, tbl: DataTable | None = None) -> None:
+        # Enter is contextbewust op basis van FOCUS. Bij dubbelklik wordt ``tbl``
+        # meegegeven (de aangeklikte tabel) zodat we niet hoeven te vertrouwen
+        # op ``has_focus`` — die kan stale zijn omdat ``set_focus`` async is.
+        # Helpers: check of tbl deze specifieke tabel is (dubbelklik) of fallback
+        # op has_focus (Enter-toets, geen tbl meegegeven).
+        def is_active(t: DataTable | None, active: DataTable) -> bool:
+            return t is active or active.has_focus
+
+        tbl_local = self.query_one("#lib-local-table", DataTable)
+        if is_active(tbl, tbl_local):
+            idx = self._row_index(tbl_local, "l:")
             if idx is not None and idx < len(self._local_tracks):
                 await self._app.play_track(self._local_tracks[idx])
             return
 
         # Lokaal > Mappen: subfolder → daal af, track → speel.
-        folders = self.query_one("#lib-folders-table", DataTable)
-        if folders.has_focus:
-            idx = self._row_index(folders, "f:")
+        tbl_folders = self.query_one("#lib-folders-table", DataTable)
+        if is_active(tbl, tbl_folders):
+            idx = self._row_index(tbl_folders, "f:")
             if idx is not None and idx < len(self._folder_entries):
                 kind, val = self._folder_entries[idx]
                 if kind == "dir":
@@ -1102,41 +1198,41 @@ class LibraryPane(Vertical):
             return
 
         # Lokaal > Albums: meta → drill, detail → speel.
-        alb_detail = self.query_one("#lib-albums-detail", DataTable)
-        if alb_detail.has_focus:
-            idx = self._row_index(alb_detail, "at:")
+        tbl_alb_detail = self.query_one("#lib-albums-detail", DataTable)
+        if is_active(tbl, tbl_alb_detail):
+            idx = self._row_index(tbl_alb_detail, "at:")
             if idx is not None and idx < len(self._album_tracks):
                 await self._app.play_track(self._album_tracks[idx])
             return
 
         # Lokaal > Artiesten.
-        art_detail = self.query_one("#lib-artists-detail", DataTable)
-        if art_detail.has_focus:
-            idx = self._row_index(art_detail, "rt:")
+        tbl_art_detail = self.query_one("#lib-artists-detail", DataTable)
+        if is_active(tbl, tbl_art_detail):
+            idx = self._row_index(tbl_art_detail, "rt:")
             if idx is not None and idx < len(self._artist_tracks):
                 await self._app.play_track(self._artist_tracks[idx])
             return
 
         # Lokaal > Genre: detail-tabel (één) + meta.
-        gt = self.query_one("#lib-genres-detail", DataTable)
-        if gt.has_focus:
+        tbl_gt = self.query_one("#lib-genres-detail", DataTable)
+        if is_active(tbl, tbl_gt):
             if self._genre_view == "tracks":
-                idx = self._row_index(gt, "gt:")
+                idx = self._row_index(tbl_gt, "gt:")
                 if idx is not None and idx < len(self._genre_tracks):
                     await self._app.play_track(self._genre_tracks[idx])
             elif self._genre_view == "artists":
-                idx = self._row_index(gt, "ga:")
+                idx = self._row_index(tbl_gt, "ga:")
                 if idx is not None and idx < len(self._genre_artists):
                     await self._drill_genre_artist(idx)
             else:  # albums
-                idx = self._row_index(gt, "gl:")
+                idx = self._row_index(tbl_gt, "gl:")
                 if idx is not None and idx < len(self._genre_albums):
                     await self._drill_genre_album(idx)
             return
 
-        # Spotify track-lijst (drill of Liked songs).
-        detail = self.query_one("#lib-detail-table", DataTable)
-        if detail.has_focus:
+        # Spotify / YouTube / Genre-detail track-lijst: speel track.
+        tbl_detail = self.query_one("#lib-detail-table", DataTable)
+        if is_active(tbl, tbl_detail):
             if not self._tracks:
                 return
             idx = self._selected_detail_index()
@@ -1145,50 +1241,54 @@ class LibraryPane(Vertical):
             await self._app.play_track(self._tracks[idx])
             return
 
+        # YouTube detail: speel track.
+        tbl_yt_detail = self.query_one("#lib-yt-detail", DataTable)
+        if is_active(tbl, tbl_yt_detail):
+            idx = self._yt_detail_index()
+            if idx is not None and idx < len(self._tracks):
+                await self._app.play_track(self._tracks[idx])
+            return
+
         # Lokaal > Albums-meta: drill album.
-        alb_meta = self.query_one("#lib-albums-meta", DataTable)
-        if alb_meta.has_focus:
-            idx = self._row_index(alb_meta, "al:")
+        tbl_alb_meta = self.query_one("#lib-albums-meta", DataTable)
+        if is_active(tbl, tbl_alb_meta):
+            idx = self._row_index(tbl_alb_meta, "al:")
             if idx is not None and idx < len(self._albums):
                 await self._drill_album(idx)
             return
 
         # Lokaal > Artiesten-meta: drill artiest.
-        art_meta = self.query_one("#lib-artists-meta", DataTable)
-        if art_meta.has_focus:
-            idx = self._row_index(art_meta, "ar:")
+        tbl_art_meta = self.query_one("#lib-artists-meta", DataTable)
+        if is_active(tbl, tbl_art_meta):
+            idx = self._row_index(tbl_art_meta, "ar:")
             if idx is not None and idx < len(self._artists):
                 await self._drill_artist(idx)
             return
 
         # Lokaal > Genre-meta: drill genre → vult 3 sub-tabs.
-        gn_meta = self.query_one("#lib-genres-meta", DataTable)
-        if gn_meta.has_focus:
-            idx = self._row_index(gn_meta, "gn:")
+        tbl_gn_meta = self.query_one("#lib-genres-meta", DataTable)
+        if is_active(tbl, tbl_gn_meta):
+            idx = self._row_index(tbl_gn_meta, "gn:")
             if idx is not None and idx < len(self._genres):
                 await self._drill_genre(idx)
             return
 
-        # Library > YouTube: detail speelt, meta drillt.
-        yt_detail = self.query_one("#lib-yt-detail", DataTable)
-        if yt_detail.has_focus:
-            idx = self._yt_detail_index()
-            if idx is not None and idx < len(self._tracks):
-                await self._app.play_track(self._tracks[idx])
-            return
-        yt_meta = self.query_one("#lib-yt-meta", DataTable)
-        if yt_meta.has_focus:
+        # YouTube meta: drill.
+        tbl_yt_meta = self.query_one("#lib-yt-meta", DataTable)
+        if is_active(tbl, tbl_yt_meta):
             await self._open_yt_collection()
             return
 
         # Spotify meta: drill album/playlist.
-        meta = self.query_one("#lib-spotify-meta", DataTable)
-        try:
-            meta_key = meta.coordinate_to_cell_key(meta.cursor_coordinate).row_key.value
-        except Exception:
-            meta_key = None
-        if meta_key and (meta_key.startswith("a:") or meta_key.startswith("p:")):
-            await self._open_spotify_collection()
+        tbl_sp_meta = self.query_one("#lib-spotify-meta", DataTable)
+        if is_active(tbl, tbl_sp_meta):
+            try:
+                meta_key = tbl_sp_meta.coordinate_to_cell_key(
+                    tbl_sp_meta.cursor_coordinate).row_key.value
+            except Exception:
+                meta_key = None
+            if meta_key and (meta_key.startswith("a:") or meta_key.startswith("p:")):
+                await self._open_spotify_collection()
 
     def _row_index(self, tbl: DataTable, prefix: str) -> int | None:
         """Algemene helper: geef de int-index uit de cursor-rij-key van tbl,
@@ -2152,11 +2252,26 @@ class LibraryPane(Vertical):
         dt.focus()
         dt.move_cursor(row=0)
         if not tracks:
-            self._app.notify(
-                f"Geen video's in {row['label']}. "
-                "Ingelogd in je browser? cookies_from_browser in config.toml?",
-                severity="warning",
-            )
+            # Eerlijke melding bij 0 resultaten. Vroeger: altijd "Ingelogd in
+            # je browser?", wat misleidend was voor FL/WL/HL (YouTube serveert
+            # die virtual playlists niet meer — cookies zijn wél goed). Nu:
+            # alleen nog die hint als cookies helemaal niet staan ingesteld;
+            # anders toon 'n generieke "0 resultaten"-melding zodat de gebruiker
+            # weet dat het geen config-issue is.
+            cfb = getattr(yt, "_cookies_from_browser", "") if yt else ""
+            if not cfb:
+                self._app.notify(
+                    f"Geen video's in {row['label']}. "
+                    "Ingelogd in je browser? cookies_from_browser in config.toml?",
+                    severity="warning",
+                )
+            else:
+                self._app.notify(
+                    f"Geen video's in {row['label']} teruggekregen. "
+                    "YouTube levert deze feed (mogelijk) niet meer extern; "
+                    "cookies zijn wél actief.",
+                    severity="warning",
+                )
 
     def _yt_detail_index(self) -> int | None:
         return self._row_index(self.query_one("#lib-yt-detail", DataTable), "yt:")
@@ -2186,7 +2301,6 @@ class MusiApp(App):
     CSS = """
     Screen { layout: vertical; layers: floating above; }
     #main { height: 1fr; }
-    NowPlaying { dock: bottom; height: 3; padding: 0 1; background: $boost; }
     SearchPane, QueuePane, LibraryPane { height: 1fr; }
     """
 
@@ -2203,6 +2317,12 @@ class MusiApp(App):
         Binding("minus", "vol_down", "Volume -"),
         Binding("c", "clear_queue", "Wis queue"),
         Binding("v", "toggle_video", "Video"),
+        # Albumhoes verplaatsen (Alt+pijltje = 1 cel; Alt+0 = reset)
+        Binding("alt+left", "move_cover_left", "Hoes ←"),
+        Binding("alt+right", "move_cover_right", "Hoes →"),
+        Binding("alt+up", "move_cover_up", "Hoes ↑"),
+        Binding("alt+down", "move_cover_down", "Hoes ↓"),
+        Binding("alt+0", "reset_cover", "Hoes ↻"),
     ]
 
     results: reactive[list[Track]] = reactive(list, recompose=False)
@@ -2225,9 +2345,6 @@ class MusiApp(App):
         self._rip_done: set[str] = set()      # video-ids die deze sessie klaar zijn
 
     def compose(self) -> ComposeResult:
-        # Albumhoes-overlay (rechtsboven) — dit widget zit op de "floating" layer
-        # zodat het boven alles rendered, ongeacht de layout-volgorde.
-        yield FloatingCover(self.cfg.cache_dir / "art", id="floating-cover")
         yield Header(show_clock=False)
         with TabbedContent(id="tabs", initial="tab-search"):
             with TabPane("Zoeken", id="tab-search"):
@@ -2235,12 +2352,12 @@ class MusiApp(App):
             with TabPane("Queue", id="tab-queue"):
                 yield QueuePane(self)
             with TabPane("Library", id="tab-library"):
-                yield LibraryPane(None)  # zodra compose zonder app; via on_mount zetten
-        # NowPlaying eerst (dock:bottom vult van onderaf), Footer daarna — anders
-        # zou Textual beide widgets op dezelfde y=laatste-rij zetten en elkaar
-        # op één pixel overdekken.
-        yield NowPlaying(self.cfg.cache_dir / "art", id="now-playing")
+                yield LibraryPane(None)
+        # FloatingCover (sixel albumhoes rechtsboven) gaat op de floating layer
+        # boven alles — yield eerst zodat Textual 'm als eerste verwerft.
+        yield FloatingCover(self.cfg.cache_dir / "art", id="floating-cover")
         yield Footer()
+        yield NowPlaying(id="now-playing")
 
     # ---- acties -----------------------------------------------------
     async def on_mount(self) -> None:
@@ -2367,10 +2484,7 @@ class MusiApp(App):
 
     def _on_orch_event(self, ev: PlaybackEvent) -> None:
         if ev.kind == "state" and ev.state is not None:
-            try:
-                self.query_one(FloatingCover).update_from_state(ev.state)
-            except Exception as e:
-                log.warning("FloatingCover query failed: %s", e)
+            self.query_one(FloatingCover).update_from_state(ev.state)
             self.query_one(NowPlaying).update_from_state(ev.state)
             # auto-rip: bij een YouTube-track plan een rip na de grace-periode.
             # _schedule_rip dedup't op video-id (goedkoop, want dit vuurt bij
@@ -2913,6 +3027,31 @@ class MusiApp(App):
     async def action_clear_queue(self) -> None:
         """Wis de hele queue."""
         self.orchestrator.queue_clear()
+
+    def _move_cover(self, dx: int, dy: int) -> None:
+        try:
+            cover = self.query_one(FloatingCover)
+            cover.move(dx, dy)
+        except Exception:
+            pass
+
+    def action_move_cover_left(self) -> None:
+        self._move_cover(-1, 0)
+
+    def action_move_cover_right(self) -> None:
+        self._move_cover(1, 0)
+
+    def action_move_cover_up(self) -> None:
+        self._move_cover(0, -1)
+
+    def action_move_cover_down(self) -> None:
+        self._move_cover(0, 1)
+
+    def action_reset_cover(self) -> None:
+        try:
+            self.query_one(FloatingCover).reset_position()
+        except Exception:
+            pass
 
     async def action_toggle_video(self) -> None:
         """V-toets: spawn een aparte mpv-instantie als **video-viewer** voor de
